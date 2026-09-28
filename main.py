@@ -50,7 +50,7 @@ MEAS_PAYLOAD_TEMPLATE = os.getenv(
 SETUP_NAME  = os.getenv("SETUP_NAME", "")
 PAGE_SIZE   = int(os.getenv("PAGE_SIZE", "50"))
 
-RELAY_VERSION = "v14"
+RELAY_VERSION = "v15"
 
 # ── relay access ─────────────────────────────────────────────────────────────
 APP_KEY    = os.getenv("APP_KEY", "")
@@ -362,10 +362,12 @@ async def tone(body: ToneIn, x_app_key: str | None = Header(default=None),
 # ── v12: RTU to RTU continuity (see relay_continuity.py) ────────────────────────
 from relay_continuity import make_router as _continuity_router
 
-async def _continuity_tone(sid, fibre, rtu_id, wl, dur, hz):
-    """Reuse the /api/tone logic exactly, including the 409 back-off."""
+async def _continuity_tone(sid, fibre, rtu_id, wl, dur, hz, route_id=None):
+    """Reuse the /api/tone logic exactly, including the 409 back-off. v15: the continuity
+    job already holds the route id, so pass it and skip the name lookup."""
+    use_id = route_id if (route_id and TONE_ID_FIELD == "id") else None
     return await tone(ToneIn(fibre=fibre, rtuId=str(rtu_id), wavelengthNm=int(wl),
-                             durationS=int(dur), freqHz=int(hz)),
+                             durationS=int(dur), freqHz=int(hz), routeId=use_id),
                       x_app_key=APP_KEY or None, x_session=sid)
 
 app.include_router(_continuity_router(_valid_token, _check_key, _continuity_tone, LIVE_TONE))

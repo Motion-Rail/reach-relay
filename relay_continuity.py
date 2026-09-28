@@ -42,16 +42,18 @@ PACE = {                              # measured on RGAC2 -> SNBC, 28 Sep 2026
     "clash_s": 10,                    # live fibre refused: the PASS
     "clean_s": 35,                    # dark fibre, full OTDR runs
     "first_test_s": 53,
-    "default_otdr_s": 5,
-    # Field runs on R1 (12 fibres): tone 10 s -> ~4 min / 13 tests; tone 5 s -> ~3 min / 12
-    # tests, no misses. The RTU's live check happens early in the OTDR, so a short tone is
-    # enough. v14 default: tone 6 s, 2 s lead (1 s more cover than the proven 5 s / 3 s).
-    # Auto pacing lengthens the tone if the expected fibre ever misses and then passes.
-    "default_tone_s": 6,
+    "default_otdr_s": 3,
+    # v15, measured on R1/R2 28 Sep 2026: straight cycle 12.8 s at tone 6 or 10 (lead 2);
+    # the tone only adds time above ~11 s. Tone 10 gives more cover for slow FMS starts.
+    # Dark OTDR: 3 s -> 17.4-18.5 s; 5 s -> 17.5-18.5 s; 1 s -> 14-35 s (erratic).
+    # Lead 1 s saved ~0.9 s a fibre but missed the first fibre once; kept at 2 s.
+    "default_tone_s": 10,
     "default_lead_s": 2,
     "max_tone_s": 20,
+    "cover_tone_s": 20,               # first test of a run, and a retry after a miss
+    "slow_cycle_s": 25,               # a miss slower than this is an FMS delay, not a short tone
 }
-RELAY_VERSION = "v14"
+RELAY_VERSION = "v15"
 JOBS: dict[str, dict] = {}
 LOCKS: dict[str, asyncio.Lock] = {}
 ROUTES: dict[str, dict[str, dict]] = {}          # rtuName -> {routeName: node}
@@ -259,6 +261,11 @@ def make_router(valid_token, check_key, tone, live_tone: bool) -> APIRouter:
                 cand_name = f"{req.stem}-{ce.fname(cand)}"
                 t0 = time.time()
                 tone_s, lead_s = pace["toneS"], pace["leadS"]
+                # v15: the first test of a run and the retry of a fibre that missed get a long
+                # tone. Field runs: every miss so far followed a slow FMS start (cycle 36-66 s),
+                # so the extra cover goes where the risk is, not on every fibre.
+                if not job["testLog"] or (cand == src and src in missed):
+                    tone_s = max(tone_s, PACE["cover_tone_s"])
                 need = max(1, min(13, tone_s - lead_s - 1))  # tone must still be on at the live check
                 if tone_state["src"] != src or tone_state["until"] - time.time() < need:
                     wait = tone_state["until"] - time.time()
@@ -267,7 +274,7 @@ def make_router(valid_token, check_key, tone, live_tone: bool) -> APIRouter:
                     node = ROUTES[req.toneRtu].get(src_name.upper())
                     try:
                         t = await tone(x_session, src_name, str(node["rtuId"]),
-                                       req.wavelengthNm, tone_s, req.freqHz)
+                                       req.wavelengthNm, tone_s, req.freqHz, str(node["id"]))
                     except HTTPException as e:
                         eng.say(f"  tone failed on {ce.fname(src)}: {e.detail}")
                         await asyncio.sleep(5)
@@ -289,7 +296,13 @@ def make_router(valid_token, check_key, tone, live_tone: bool) -> APIRouter:
                 # was probably too short, so give it 2 s more (and 1 s more lead) from now on.
                 if cand == src and v == "clean":
                     missed.add(src)
+                    slow_miss = (time.time() - t0) > PACE["slow_cycle_s"]
+                    job.setdefault("missNotes", []).append({"fibre": src, "cycleS": round(time.time() - t0, 1), "slow": slow_miss})
+                    if slow_miss:
+                        eng.say(f"  {ce.fname(src)} read dark after a slow FMS start ({round(time.time() - t0)} s); "
+                                f"retrying with a {PACE['cover_tone_s']} s tone, pace unchanged")
                 elif cand == src and v == "clash" and src in missed and pace["auto"] \
+                        and not job["missNotes"][-1]["slow"] \
                         and pace["toneS"] < PACE["max_tone_s"]:
                     pace["toneS"] = min(PACE["max_tone_s"], pace["toneS"] + 2)
                     pace["leadS"] = min(4, pace["leadS"] + 1)
