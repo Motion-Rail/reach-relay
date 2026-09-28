@@ -1,0 +1,336 @@
+"""
+relay_continuity.py  -  RTU to RTU continuity, run on the relay (v12).
+
+Method, proven on RGAC2 -> SNBC on 28 Sep 2026: tone fibre n at one end, order an
+AdHoc OTDR on fibre n at the other. The far RTU refuses with 112_LiveFiberDetected
+when the light is on that fibre (PASS). A completed OTDR means the tone is elsewhere.
+
+The sweep runs here as a background job, not in the browser, so a phone can lock
+or a laptop can close and the run carries on. Any signed-in device can watch it.
+Jobs live in memory: a relay restart ends them (results so far are in the last
+status the app saved).
+
+Routes (all POST, X-App-Key + X-Session as for /api/tone):
+  /api/continuity/start    {toneRtu, testRtu, stem, ribbons[], toneS?, otdrS?, leadS?,
+                            wavelengthNm?, freqHz?, simulate?}      -> {jobId}
+  /api/continuity/status   {jobId}                                    -> job snapshot
+  /api/continuity/control  {jobId, action: pause|resume|stop}
+  /api/continuity/jobs     {}                                         -> recent jobs
+  /api/continuity/test     one tone + one OTDR, for checks by hand
+  /api/otdr                one OTDR on one fibre
+  /api/continuity/pace     measured timings
+
+Safety: fibres in CONTINUITY_EXCLUDE (route names or ribbon ranges, e.g. R35-36)
+are never toned or tested. Live runs refuse to start when LIVE_TONE is off, because
+every fibre would read "not found".
+"""
+from __future__ import annotations
+
+import asyncio
+import os
+import re
+import time
+import uuid
+
+from fastapi import APIRouter, HTTPException, Header
+from pydantic import BaseModel
+
+import continuity_engine as ce
+from fms_continuity import Fms, StartRefused
+
+PACE = {                              # measured, PoC 28 Sep 2026, 5 s OTDR
+    "clash_s": 10,                    # live fibre refused: the PASS
+    "clean_s": 35,                    # dark fibre, full OTDR runs
+    "first_test_s": 53,
+    "default_otdr_s": 5,
+    "default_tone_s": 20,             # must cover lead + the RTU's live check (~10 s)
+    "default_lead_s": 3,
+}
+JOBS: dict[str, dict] = {}
+LOCKS: dict[str, asyncio.Lock] = {}
+ROUTES: dict[str, dict[str, dict]] = {}          # rtuName -> {routeName: node}
+
+
+def _excluded() -> tuple[set, list]:
+    names, ribbons = set(), []
+    for tok in filter(None, (t.strip() for t in os.environ.get("CONTINUITY_EXCLUDE", "").split(","))):
+        m = re.fullmatch(r"R(\d+)(?:-(\d+))?", tok, re.I)
+        if m:
+            a = int(m.group(1)); ribbons.append((a, int(m.group(2) or a)))
+        else:
+            names.add(tok.upper())
+    return names, ribbons
+
+
+def is_excluded(route_name: str) -> bool:
+    names, ribbons = _excluded()
+    if route_name.upper() in names:
+        return True
+    m = re.search(r"F(\d{3})$", route_name)
+    if m:
+        r = (int(m.group(1)) - 1) // 12 + 1
+        return any(a <= r <= b for a, b in ribbons)
+    return False
+
+
+class OtdrReq(BaseModel):
+    rtuName: str
+    fibre: str
+    durationS: int = PACE["default_otdr_s"]
+    rangeM: int = 80000
+    comment: str = "continuity"
+
+
+class TestReq(BaseModel):
+    toneRtu: str
+    testRtu: str
+    source: int
+    candidate: int
+    stem: str = "F-RGAC-SNBC-A-R432"
+    toneS: int = PACE["default_tone_s"]
+    wavelengthNm: int = 1550
+    freqHz: int = 0
+    durationS: int = PACE["default_otdr_s"]
+
+
+class StartReq(BaseModel):
+    toneRtu: str
+    testRtu: str
+    stem: str
+    ribbons: list[int]
+    toneRtuId: str | None = None
+    toneS: int = PACE["default_tone_s"]
+    otdrS: int = PACE["default_otdr_s"]
+    leadS: float = PACE["default_lead_s"]
+    wavelengthNm: int = 1550
+    freqHz: int = 0
+    simulate: str | None = None       # none | reverse | swapRibbon | swapBundle | pair | mixed
+
+
+class JobReq(BaseModel):
+    jobId: str
+    action: str | None = None
+
+
+def make_router(valid_token, check_key, tone, live_tone: bool) -> APIRouter:
+    """valid_token: async (session_id) -> bearer   (main._valid_token)
+       check_key:   (x_app_key) -> None raises 401 (main._check_key)
+       tone:        async (session_id, fibre, rtuId, wl, dur, hz) -> dict  (wraps main.tone)
+    """
+    router = APIRouter()
+
+    async def fms_for(sid: str) -> Fms:
+        tok = await valid_token(sid)
+        box = {"t": tok, "at": time.time()}
+
+        def provider():
+            return box["t"]
+
+        f = Fms.from_token_provider(provider)
+
+        async def refresh():                      # called by the job between tests
+            box["t"] = await valid_token(sid)
+        f._refresh = refresh
+        return f
+
+    async def routes(fms: Fms, rtu: str) -> dict[str, dict]:
+        if rtu not in ROUTES:
+            nodes = await asyncio.to_thread(fms.routes_for_rtu, rtu)
+            if not nodes:
+                raise HTTPException(404, f"No routes on {rtu}")
+            ROUTES[rtu] = {n["name"].upper(): n for n in nodes}
+        return ROUTES[rtu]
+
+    async def run_otdr(fms: Fms, rtu: str, name: str, dur: int, comment: str) -> dict:
+        if is_excluded(name):
+            raise HTTPException(423, f"{name} is excluded from continuity testing")
+        node = (await routes(fms, rtu)).get(name.upper())
+        if not node:
+            raise HTTPException(404, f"{name} not on {rtu}")
+        async with LOCKS.setdefault(rtu, asyncio.Lock()):
+            t0 = time.time()
+            try:
+                wid = await asyncio.to_thread(fms.start_otdr, node["rtuId"], node["id"], name,
+                                              duration=dur, range_m=80000, comment=comment)
+            except StartRefused as e:
+                return {"verdict": "start_refused", "detail": str(e), "seconds": round(time.time() - t0, 1)}
+            out = await asyncio.to_thread(fms.wait, wid)
+        return {"verdict": out.verdict, "detail": out.detail[:600], "seconds": round(out.seconds, 1),
+                "workflowId": wid}
+
+    # ---------------- single calls ----------------
+    @router.post("/api/continuity/pace")
+    async def pace(x_app_key: str | None = Header(default=None)):
+        check_key(x_app_key)
+        return {**PACE, "live_tone": live_tone}
+
+    @router.post("/api/otdr")
+    async def otdr(req: OtdrReq, x_app_key: str | None = Header(default=None),
+                   x_session: str | None = Header(default=None)):
+        check_key(x_app_key)
+        fms = await fms_for(x_session)
+        return await run_otdr(fms, req.rtuName, req.fibre, req.durationS, req.comment)
+
+    @router.post("/api/continuity/test")
+    async def cont_test(req: TestReq, x_app_key: str | None = Header(default=None),
+                        x_session: str | None = Header(default=None)):
+        check_key(x_app_key)
+        fms = await fms_for(x_session)
+        src = f"{req.stem}-F{req.source:03d}"
+        cand = f"{req.stem}-F{req.candidate:03d}"
+        if is_excluded(src):
+            raise HTTPException(423, f"{src} is excluded from continuity testing")
+        tix = await routes(fms, req.toneRtu)
+        if src.upper() not in tix:
+            raise HTTPException(404, f"{src} not on {req.toneRtu}")
+        t = await tone(x_session, src, str(tix[src.upper()]["rtuId"]), req.wavelengthNm, req.toneS, req.freqHz)
+        await asyncio.sleep(PACE["default_lead_s"])
+        res = await run_otdr(fms, req.testRtu, cand, req.durationS, f"continuity {src[-4:]} to {cand[-4:]}")
+        return {**res, "source": req.source, "candidate": req.candidate, "tone": t}
+
+    # ---------------- background sweep ----------------
+    @router.post("/api/continuity/start")
+    async def start(req: StartReq, x_app_key: str | None = Header(default=None),
+                    x_session: str | None = Header(default=None)):
+        check_key(x_app_key)
+        for j in JOBS.values():
+            if j["state"] in ("running", "paused") and not j["simulate"] and not req.simulate and \
+                    {j["toneRtu"], j["testRtu"]} & {req.toneRtu, req.testRtu}:
+                raise HTTPException(409, f"A continuity run is already using {j['toneRtu']} / {j['testRtu']} "
+                                         f"(job {j['id'][:8]}). Stop it first.")
+        if not req.simulate and not live_tone:
+            raise HTTPException(409, "The relay has LIVE_TONE off, so no light would reach the fibre. "
+                                     "Set LIVE_TONE=1 on the relay, or run a simulation.")
+        targets = [f for f in ce.ribbons_to_targets(req.ribbons)
+                   if not is_excluded(f"{req.stem}-{ce.fname(f)}")]
+        if not targets:
+            raise HTTPException(400, "No fibres to test (none selected, or all excluded)")
+
+        eng = ce.Engine()
+        jid = uuid.uuid4().hex
+        job = {"id": jid, "state": "running", "simulate": req.simulate or "", "stem": req.stem,
+               "toneRtu": req.toneRtu, "testRtu": req.testRtu, "ribbons": sorted(set(req.ribbons)),
+               "targets": len(targets), "started": time.time(), "ended": None, "rtuSeconds": 0.0,
+               "error": "", "settings": req.model_dump(), "engine": eng, "truthNotes": [],
+               "user": "", "pauseEvt": asyncio.Event()}
+        job["pauseEvt"].set()
+        JOBS[jid] = job
+
+        async def control() -> bool:
+            await job["pauseEvt"].wait()
+            return job["state"] != "stopped"
+
+        if req.simulate:
+            truth, notes = ce.planted_truth(req.simulate)
+            job["truthNotes"] = notes
+            base = ce.sim_tester(truth, miss_rate=0.05, delay=0.25)
+
+            async def test(src, cand):
+                r = await base(src, cand)
+                job["rtuSeconds"] += PACE["clash_s"] if r == "clash" else PACE["clean_s"]
+                return r
+        else:
+            fms = await fms_for(x_session)
+            await routes(fms, req.toneRtu)
+            await routes(fms, req.testRtu)
+            tone_state = {"src": 0, "until": 0.0}
+
+            async def test(src, cand):
+                await fms._refresh()
+                src_name = f"{req.stem}-{ce.fname(src)}"
+                cand_name = f"{req.stem}-{ce.fname(cand)}"
+                need = min(13, req.toneS - req.leadS - 1)   # tone must outlast the live check (~10 s)
+                if tone_state["src"] != src or tone_state["until"] - time.time() < need:
+                    wait = tone_state["until"] - time.time()
+                    if wait > 0:                            # one source per RTU
+                        await asyncio.sleep(wait + 0.5)
+                    node = ROUTES[req.toneRtu].get(src_name.upper())
+                    try:
+                        t = await tone(x_session, src_name, str(node["rtuId"]),
+                                       req.wavelengthNm, req.toneS, req.freqHz)
+                    except HTTPException as e:
+                        eng.say(f"  tone failed on {ce.fname(src)}: {e.detail}")
+                        await asyncio.sleep(5)
+                        return "error"
+                    if t.get("simulated"):
+                        raise RuntimeError("Relay tone is simulated (LIVE_TONE=0)")
+                    tone_state.update(src=src, until=time.time() + req.toneS)
+                    await asyncio.sleep(req.leadS)
+                res = await run_otdr(fms, req.testRtu, cand_name, req.otdrS,
+                                     f"continuity {ce.fname(src)} to {ce.fname(cand)}")
+                job["rtuSeconds"] += res.get("seconds", 0)
+                v = res["verdict"]
+                if v in ("clash", "clean"):
+                    return v
+                eng.say(f"  {ce.fname(cand)}: {v} {res.get('detail', '')[:160]}")
+                if v == "start_refused":
+                    await asyncio.sleep(15)                 # someone else is using the RTU
+                return "error"
+
+        async def runner():
+            try:
+                eng.say(f"Run started: {len(targets)} fibres, tone {req.toneRtu}, OTDR {req.testRtu}"
+                        + (f", SIMULATION ({req.simulate})" if req.simulate else ""))
+                done = await eng.run(targets, test, control)
+                job["state"] = "done" if done else "stopped"
+                eng.say("Run complete." if done else "Stopped.")
+            except Exception as e:                          # noqa: BLE001
+                job["state"] = "error"
+                job["error"] = str(e)[:300]
+                eng.say("Run failed: " + job["error"])
+            finally:
+                job["ended"] = time.time()
+
+        job["task"] = asyncio.create_task(runner())
+        return {"ok": True, "jobId": jid}
+
+    def snap(job: dict, full: bool = True) -> dict:
+        eng: ce.Engine = job["engine"]
+        res = eng.results
+        counts = {"straight": sum(r.state == "straight" for r in res.values()),
+                  "cross": sum(r.state == "cross" for r in res.values()),
+                  "unres": sum(r.state == "unres" for r in res.values())}
+        out = {k: job[k] for k in ("id", "state", "simulate", "stem", "toneRtu", "testRtu", "ribbons",
+                                   "targets", "started", "ended", "error", "truthNotes")}
+        out.update(done=len(res), counts=counts, tests=eng.tests, rtuSeconds=round(job["rtuSeconds"]),
+                   current=eng.current, candidate=eng.candidate, now=time.time())
+        if full:
+            out.update(eng.snapshot())
+            out["settings"] = job["settings"]
+        return out
+
+    @router.post("/api/continuity/status")
+    async def status(req: JobReq, x_app_key: str | None = Header(default=None),
+                     x_session: str | None = Header(default=None)):
+        check_key(x_app_key)
+        job = JOBS.get(req.jobId)
+        if not job:
+            raise HTTPException(404, "No such run on the relay (it may have restarted)")
+        return snap(job)
+
+    @router.post("/api/continuity/control")
+    async def control_ep(req: JobReq, x_app_key: str | None = Header(default=None),
+                         x_session: str | None = Header(default=None)):
+        check_key(x_app_key)
+        job = JOBS.get(req.jobId)
+        if not job:
+            raise HTTPException(404, "No such run")
+        if job["state"] not in ("running", "paused"):
+            return snap(job, False)
+        if req.action == "pause":
+            job["state"] = "paused"; job["pauseEvt"].clear()
+        elif req.action == "resume":
+            job["state"] = "running"; job["pauseEvt"].set()
+        elif req.action == "stop":
+            job["state"] = "stopped"; job["pauseEvt"].set()
+        else:
+            raise HTTPException(400, "action must be pause, resume or stop")
+        return snap(job, False)
+
+    @router.post("/api/continuity/jobs")
+    async def jobs(x_app_key: str | None = Header(default=None)):
+        check_key(x_app_key)
+        lst = sorted(JOBS.values(), key=lambda j: j["started"], reverse=True)[:20]
+        return {"jobs": [snap(j, False) for j in lst]}
+
+    return router
