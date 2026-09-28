@@ -38,14 +38,20 @@ from pydantic import BaseModel
 import continuity_engine as ce
 from fms_continuity import Fms, StartRefused
 
-PACE = {                              # measured, PoC 28 Sep 2026, 5 s OTDR
+PACE = {                              # measured on RGAC2 -> SNBC, 28 Sep 2026
     "clash_s": 10,                    # live fibre refused: the PASS
     "clean_s": 35,                    # dark fibre, full OTDR runs
     "first_test_s": 53,
     "default_otdr_s": 5,
-    "default_tone_s": 20,             # must cover lead + the RTU's live check (~10 s)
-    "default_lead_s": 3,
+    # Field runs on R1 (12 fibres): tone 10 s -> ~4 min / 13 tests; tone 5 s -> ~3 min / 12
+    # tests, no misses. The RTU's live check happens early in the OTDR, so a short tone is
+    # enough. v14 default: tone 6 s, 2 s lead (1 s more cover than the proven 5 s / 3 s).
+    # Auto pacing lengthens the tone if the expected fibre ever misses and then passes.
+    "default_tone_s": 6,
+    "default_lead_s": 2,
+    "max_tone_s": 20,
 }
+RELAY_VERSION = "v14"
 JOBS: dict[str, dict] = {}
 LOCKS: dict[str, asyncio.Lock] = {}
 ROUTES: dict[str, dict[str, dict]] = {}          # rtuName -> {routeName: node}
@@ -60,6 +66,11 @@ def _excluded() -> tuple[set, list]:
         else:
             names.add(tok.upper())
     return names, ribbons
+
+
+def _avg(xs):
+    xs = [x for x in xs if x is not None]
+    return round(sum(xs) / len(xs), 1) if xs else None
 
 
 def is_excluded(route_name: str) -> bool:
@@ -102,9 +113,11 @@ class StartReq(BaseModel):
     toneS: int = PACE["default_tone_s"]
     otdrS: int = PACE["default_otdr_s"]
     leadS: float = PACE["default_lead_s"]
+    autoPace: bool = True             # lengthen the tone if the expected fibre misses
     wavelengthNm: int = 1550
     freqHz: int = 0
-    simulate: str | None = None       # none | reverse | swapRibbon | swapBundle | pair | mixed
+    simulate: str | None = None       # testing only; not offered in the app since v14
+    appVersion: str = ""
 
 
 class JobReq(BaseModel):
@@ -212,7 +225,9 @@ def make_router(valid_token, check_key, tone, live_tone: bool) -> APIRouter:
                "toneRtu": req.toneRtu, "testRtu": req.testRtu, "ribbons": sorted(set(req.ribbons)),
                "targets": len(targets), "started": time.time(), "ended": None, "rtuSeconds": 0.0,
                "error": "", "settings": req.model_dump(), "engine": eng, "truthNotes": [],
-               "user": "", "pauseEvt": asyncio.Event()}
+               "user": "", "pauseEvt": asyncio.Event(), "testLog": [],
+               "pace": {"toneS": req.toneS, "leadS": req.leadS, "auto": req.autoPace, "changes": []},
+               "appVersion": req.appVersion}
         job["pauseEvt"].set()
         JOBS[jid] = job
 
@@ -228,18 +243,23 @@ def make_router(valid_token, check_key, tone, live_tone: bool) -> APIRouter:
             async def test(src, cand):
                 r = await base(src, cand)
                 job["rtuSeconds"] += PACE["clash_s"] if r == "clash" else PACE["clean_s"]
+                job["testLog"].append({"t": round(time.time(), 1), "src": src, "cand": cand, "verdict": r})
                 return r
         else:
             fms = await fms_for(x_session)
             await routes(fms, req.toneRtu)
             await routes(fms, req.testRtu)
             tone_state = {"src": 0, "until": 0.0}
+            missed = set()                                  # sources whose own fibre read clean once
+            pace = job["pace"]
 
             async def test(src, cand):
                 await fms._refresh()
                 src_name = f"{req.stem}-{ce.fname(src)}"
                 cand_name = f"{req.stem}-{ce.fname(cand)}"
-                need = min(13, req.toneS - req.leadS - 1)   # tone must outlast the live check (~10 s)
+                t0 = time.time()
+                tone_s, lead_s = pace["toneS"], pace["leadS"]
+                need = max(1, min(13, tone_s - lead_s - 1))  # tone must still be on at the live check
                 if tone_state["src"] != src or tone_state["until"] - time.time() < need:
                     wait = tone_state["until"] - time.time()
                     if wait > 0:                            # one source per RTU
@@ -247,19 +267,36 @@ def make_router(valid_token, check_key, tone, live_tone: bool) -> APIRouter:
                     node = ROUTES[req.toneRtu].get(src_name.upper())
                     try:
                         t = await tone(x_session, src_name, str(node["rtuId"]),
-                                       req.wavelengthNm, req.toneS, req.freqHz)
+                                       req.wavelengthNm, tone_s, req.freqHz)
                     except HTTPException as e:
                         eng.say(f"  tone failed on {ce.fname(src)}: {e.detail}")
                         await asyncio.sleep(5)
                         return "error"
                     if t.get("simulated"):
                         raise RuntimeError("Relay tone is simulated (LIVE_TONE=0)")
-                    tone_state.update(src=src, until=time.time() + req.toneS)
-                    await asyncio.sleep(req.leadS)
+                    tone_state.update(src=src, until=time.time() + tone_s)
+                    await asyncio.sleep(lead_s)
                 res = await run_otdr(fms, req.testRtu, cand_name, req.otdrS,
                                      f"continuity {ce.fname(src)} to {ce.fname(cand)}")
                 job["rtuSeconds"] += res.get("seconds", 0)
                 v = res["verdict"]
+                job["testLog"].append({"t": round(t0, 1), "src": src, "cand": cand, "verdict": v,
+                                       "otdrS": res.get("seconds"), "cycleS": round(time.time() - t0, 1),
+                                       "toneS": tone_s, "leadS": lead_s, "workflow": res.get("workflowId", ""),
+                                       "detail": ("" if v in ("clash", "clean") else res.get("detail", "")[:300])})
+                del job["testLog"][:-5000]
+                # Auto pacing: the expected fibre read clean, then passed on the retry. The tone
+                # was probably too short, so give it 2 s more (and 1 s more lead) from now on.
+                if cand == src and v == "clean":
+                    missed.add(src)
+                elif cand == src and v == "clash" and src in missed and pace["auto"] \
+                        and pace["toneS"] < PACE["max_tone_s"]:
+                    pace["toneS"] = min(PACE["max_tone_s"], pace["toneS"] + 2)
+                    pace["leadS"] = min(4, pace["leadS"] + 1)
+                    pace["changes"].append({"t": round(time.time(), 1), "fibre": src,
+                                            "toneS": pace["toneS"], "leadS": pace["leadS"]})
+                    eng.say(f"  auto pace: {ce.fname(src)} passed only on the retry, tone now "
+                            f"{pace['toneS']} s, lead {pace['leadS']} s")
                 if v in ("clash", "clean"):
                     return v
                 eng.say(f"  {ce.fname(cand)}: {v} {res.get('detail', '')[:160]}")
@@ -292,6 +329,8 @@ def make_router(valid_token, check_key, tone, live_tone: bool) -> APIRouter:
                   "unres": sum(r.state == "unres" for r in res.values())}
         out = {k: job[k] for k in ("id", "state", "simulate", "stem", "toneRtu", "testRtu", "ribbons",
                                    "targets", "started", "ended", "error", "truthNotes")}
+        out.update(pace={k: job["pace"][k] for k in ("toneS", "leadS", "auto")},
+                   appVersion=job.get("appVersion", ""), relayVersion=RELAY_VERSION)
         out.update(done=len(res), counts=counts, tests=eng.tests, rtuSeconds=round(job["rtuSeconds"]),
                    current=eng.current, candidate=eng.candidate, now=time.time())
         if full:
@@ -326,6 +365,28 @@ def make_router(valid_token, check_key, tone, live_tone: bool) -> APIRouter:
         else:
             raise HTTPException(400, "action must be pause, resume or stop")
         return snap(job, False)
+
+    @router.post("/api/continuity/debug")
+    async def debug(req: JobReq, x_app_key: str | None = Header(default=None),
+                    x_session: str | None = Header(default=None)):
+        """Everything needed to diagnose a run: every test with timings, pace changes, full log."""
+        check_key(x_app_key)
+        job = JOBS.get(req.jobId)
+        if not job:
+            raise HTTPException(404, "No such run")
+        eng: ce.Engine = job["engine"]
+        out = snap(job)
+        out["log"] = eng.log[-400:]
+        out["testLog"] = job["testLog"]
+        out["paceChanges"] = job["pace"]["changes"]
+        cyc = [t["cycleS"] for t in job["testLog"] if t.get("cycleS")]
+        out["timing"] = {"tests": len(job["testLog"]),
+                         "avgCycleS": round(sum(cyc) / len(cyc), 1) if cyc else None,
+                         "clashAvgS": _avg([t["otdrS"] for t in job["testLog"] if t["verdict"] == "clash" and t.get("otdrS")]),
+                         "cleanAvgS": _avg([t["otdrS"] for t in job["testLog"] if t["verdict"] == "clean" and t.get("otdrS")]),
+                         "elapsedS": round((job["ended"] or time.time()) - job["started"])}
+        out["excluded"] = os.environ.get("CONTINUITY_EXCLUDE", "")
+        return out
 
     @router.post("/api/continuity/jobs")
     async def jobs(x_app_key: str | None = Header(default=None)):

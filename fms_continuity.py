@@ -185,7 +185,7 @@ class Fms:
         r.raise_for_status()
         return r.json()
 
-    def wait(self, wid: str, poll: float = 2.0, limit: float = 300) -> "Outcome":
+    def wait(self, wid: str, poll: float = 1.0, limit: float = 300) -> "Outcome":
         t0 = time.time()
         while True:
             wf = self.workflow(wid)
