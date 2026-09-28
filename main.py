@@ -50,6 +50,8 @@ MEAS_PAYLOAD_TEMPLATE = os.getenv(
 SETUP_NAME  = os.getenv("SETUP_NAME", "")
 PAGE_SIZE   = int(os.getenv("PAGE_SIZE", "50"))
 
+RELAY_VERSION = "v12"
+
 # ── relay access ─────────────────────────────────────────────────────────────
 APP_KEY    = os.getenv("APP_KEY", "")
 APP_ORIGIN = os.getenv("APP_ORIGIN", "*")
@@ -244,7 +246,7 @@ class ToneIn(BaseModel):
 # ── endpoints ───────────────────────────────────────────────────────────────────
 @app.get("/health")
 async def health():
-    return {"ok": True, "auth_host": AUTH_BASE, "topo_host": TOPO_HOST,
+    return {"ok": True, "version": RELAY_VERSION, "auth_host": AUTH_BASE, "topo_host": TOPO_HOST,
             "graphql": GRAPHQL_URL, "tone": "live" if LIVE_TONE else "simulated",
             "tone_id_field": TONE_ID_FIELD, "cached": len(ROUTE_ID_CACHE), "rtus": len(RTU_INDEX), "client": CLIENT_ID}
 
@@ -350,3 +352,15 @@ async def tone(body: ToneIn, x_app_key: str | None = Header(default=None),
                                  "Wait for the current tone to finish, or clear the pending "
                                  "test in FMS, then try again.")
     raise HTTPException(502, f"EXFO tone call failed ({last.status_code}): {last.text[:200]}")
+
+
+# ── v12: RTU to RTU continuity (see relay_continuity.py) ────────────────────────
+from relay_continuity import make_router as _continuity_router
+
+async def _continuity_tone(sid, fibre, rtu_id, wl, dur, hz):
+    """Reuse the /api/tone logic exactly, including the 409 back-off."""
+    return await tone(ToneIn(fibre=fibre, rtuId=str(rtu_id), wavelengthNm=int(wl),
+                             durationS=int(dur), freqHz=int(hz)),
+                      x_app_key=APP_KEY or None, x_session=sid)
+
+app.include_router(_continuity_router(_valid_token, _check_key, _continuity_tone, LIVE_TONE))
