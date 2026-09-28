@@ -50,17 +50,22 @@ MEAS_PAYLOAD_TEMPLATE = os.getenv(
 SETUP_NAME  = os.getenv("SETUP_NAME", "")
 PAGE_SIZE   = int(os.getenv("PAGE_SIZE", "50"))
 
-RELAY_VERSION = "v12"
+RELAY_VERSION = "v13"
 
 # ── relay access ─────────────────────────────────────────────────────────────
 APP_KEY    = os.getenv("APP_KEY", "")
 APP_ORIGIN = os.getenv("APP_ORIGIN", "*")
+# v13: the app moved to motionrail.onrender.com. APP_ORIGIN (env) may hold one or more
+# comma-separated origins; APP_ORIGINS_EXTRA adds more without touching APP_ORIGIN.
+APP_ORIGINS_EXTRA = os.getenv("APP_ORIGINS_EXTRA", "https://motionrail.onrender.com")
+ALLOWED_ORIGINS = (["*"] if APP_ORIGIN.strip() == "*" else
+                   sorted({o.strip().rstrip("/") for o in (APP_ORIGIN + "," + APP_ORIGINS_EXTRA).split(",") if o.strip()}))
 TOKEN_TTL_FALLBACK = int(os.getenv("TOKEN_TTL_FALLBACK", "900"))
 
 app = FastAPI(title="Fibre Tone Tester relay")
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=[APP_ORIGIN] if APP_ORIGIN != "*" else ["*"],
+    allow_origins=ALLOWED_ORIGINS,
     allow_methods=["*"], allow_headers=["*"],
 )
 
@@ -246,7 +251,7 @@ class ToneIn(BaseModel):
 # ── endpoints ───────────────────────────────────────────────────────────────────
 @app.get("/health")
 async def health():
-    return {"ok": True, "version": RELAY_VERSION, "auth_host": AUTH_BASE, "topo_host": TOPO_HOST,
+    return {"ok": True, "version": RELAY_VERSION, "origins": ALLOWED_ORIGINS, "auth_host": AUTH_BASE, "topo_host": TOPO_HOST,
             "graphql": GRAPHQL_URL, "tone": "live" if LIVE_TONE else "simulated",
             "tone_id_field": TONE_ID_FIELD, "cached": len(ROUTE_ID_CACHE), "rtus": len(RTU_INDEX), "client": CLIENT_ID}
 
