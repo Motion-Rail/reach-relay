@@ -50,7 +50,7 @@ MEAS_PAYLOAD_TEMPLATE = os.getenv(
 SETUP_NAME  = os.getenv("SETUP_NAME", "")
 PAGE_SIZE   = int(os.getenv("PAGE_SIZE", "50"))
 
-RELAY_VERSION = "v15"
+RELAY_VERSION = "v17"
 
 # ── relay access ─────────────────────────────────────────────────────────────
 APP_KEY    = os.getenv("APP_KEY", "")
@@ -125,7 +125,7 @@ async def _refresh_grant(refresh_token):
 def _store(sid, tok, user):
     ttl = int(tok.get("expires_in", TOKEN_TTL_FALLBACK))
     SESSIONS[sid] = {"access": tok["access_token"], "refresh": tok.get("refresh_token", ""),
-                     "exp": time.time() + ttl - 30, "user": user}
+                     "exp": time.time() + ttl - min(150, ttl // 2), "user": user}
 
 async def _valid_token(sid):
     s = SESSIONS.get(sid)

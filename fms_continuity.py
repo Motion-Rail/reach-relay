@@ -113,12 +113,26 @@ class Fms:
             self._grant({"grant_type": "refresh_token", "refresh_token": self.refresh})
         return {"Authorization": "Bearer " + self.token}
 
+    def _force_new_token(self):
+        """v17: a 401 mid run means the token ran out. Ask the provider for a fresh one."""
+        f = getattr(self, "_force", None)
+        if f:
+            f()
+
     def get(self, url, **kw):
-        return self.s.get(url, headers=self._auth(), timeout=self.timeout, **kw)
+        r = self.s.get(url, headers=self._auth(), timeout=self.timeout, **kw)
+        if r.status_code == 401 and getattr(self, "_provider", None):
+            self._force_new_token()
+            r = self.s.get(url, headers=self._auth(), timeout=self.timeout, **kw)
+        return r
 
     def post(self, url, **kw):
-        h = {**self._auth(), **kw.pop("headers", {})}
-        return self.s.post(url, headers=h, timeout=self.timeout, **kw)
+        extra = kw.pop("headers", {})
+        r = self.s.post(url, headers={**self._auth(), **extra}, timeout=self.timeout, **kw)
+        if r.status_code == 401 and getattr(self, "_provider", None):
+            self._force_new_token()
+            r = self.s.post(url, headers={**self._auth(), **extra}, timeout=self.timeout, **kw)
+        return r
 
     # ---- topology ----
     def routes_for_rtu(self, rtu_name: str) -> list[dict]:
@@ -185,7 +199,7 @@ class Fms:
         r.raise_for_status()
         return r.json()
 
-    def wait(self, wid: str, poll: float = 1.0, limit: float = 300) -> "Outcome":
+    def wait(self, wid: str, poll: float = 1.0, limit: float = 90) -> "Outcome":
         t0 = time.time()
         while True:
             wf = self.workflow(wid)

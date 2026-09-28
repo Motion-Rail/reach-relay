@@ -53,7 +53,7 @@ PACE = {                              # measured on RGAC2 -> SNBC, 28 Sep 2026
     "cover_tone_s": 20,               # first test of a run, and a retry after a miss
     "slow_cycle_s": 25,               # a miss slower than this is an FMS delay, not a short tone
 }
-RELAY_VERSION = "v15"
+RELAY_VERSION = "v17"
 JOBS: dict[str, dict] = {}
 LOCKS: dict[str, asyncio.Lock] = {}
 ROUTES: dict[str, dict[str, dict]] = {}          # rtuName -> {routeName: node}
@@ -120,6 +120,8 @@ class StartReq(BaseModel):
     freqHz: int = 0
     simulate: str | None = None       # testing only; not offered in the app since v14
     appVersion: str = ""
+    prior: dict[str, dict] | None = None   # v17 resume: {"12": {"state": "straight", "found": 12}}
+    resumeOf: str | None = None
 
 
 class JobReq(BaseModel):
@@ -137,14 +139,34 @@ def make_router(valid_token, check_key, tone, live_tone: bool) -> APIRouter:
     async def fms_for(sid: str) -> Fms:
         tok = await valid_token(sid)
         box = {"t": tok, "at": time.time()}
+        loop = asyncio.get_running_loop()
+
+        def fetch():
+            # v17: FMS calls run in worker threads, so they can ask the event loop for a
+            # current token. Before v17 the token was only renewed between tests, and a long
+            # OTDR poll ran past its expiry (401 on the workflow status, run killed at F126).
+            try:
+                asyncio.get_running_loop()
+                return                              # on the loop thread: keep the cached one
+            except RuntimeError:
+                pass
+            try:
+                box["t"] = asyncio.run_coroutine_threadsafe(valid_token(sid), loop).result(30)
+                box["at"] = time.time()
+            except Exception:                       # noqa: BLE001
+                pass
 
         def provider():
+            if time.time() - box["at"] > 20:
+                fetch()
             return box["t"]
 
         f = Fms.from_token_provider(provider)
+        f._force = fetch
 
         async def refresh():                      # called by the job between tests
             box["t"] = await valid_token(sid)
+            box["at"] = time.time()
         f._refresh = refresh
         return f
 
@@ -222,14 +244,24 @@ def make_router(valid_token, check_key, tone, live_tone: bool) -> APIRouter:
             raise HTTPException(400, "No fibres to test (none selected, or all excluded)")
 
         eng = ce.Engine()
+        for k, v in (req.prior or {}).items():          # v17: resume carries finished fibres over
+            try:
+                f, st = int(k), v.get("state")
+            except Exception:                           # noqa: BLE001
+                continue
+            if st in ("straight", "cross") and f in targets:
+                found = int(v.get("found") or f)
+                eng.results[f] = ce.Result(st, found, int(v.get("tests") or 0),
+                                           (v.get("why") or "") + " (earlier run)")
+                eng.used_far.add(found)
         jid = uuid.uuid4().hex
         job = {"id": jid, "state": "running", "simulate": req.simulate or "", "stem": req.stem,
                "toneRtu": req.toneRtu, "testRtu": req.testRtu, "ribbons": sorted(set(req.ribbons)),
                "targets": len(targets), "started": time.time(), "ended": None, "rtuSeconds": 0.0,
-               "error": "", "settings": req.model_dump(), "engine": eng, "truthNotes": [],
+               "error": "", "settings": req.model_dump(exclude={"prior"}), "engine": eng, "truthNotes": [],
                "user": "", "pauseEvt": asyncio.Event(), "testLog": [],
                "pace": {"toneS": req.toneS, "leadS": req.leadS, "auto": req.autoPace, "changes": []},
-               "appVersion": req.appVersion}
+               "appVersion": req.appVersion, "resumeOf": req.resumeOf or "", "carried": len(eng.results)}
         job["pauseEvt"].set()
         JOBS[jid] = job
 
@@ -256,6 +288,20 @@ def make_router(valid_token, check_key, tone, live_tone: bool) -> APIRouter:
             pace = job["pace"]
 
             async def test(src, cand):
+                # v17: nothing inside one test may end the run. Any fault is logged as an
+                # error and the engine retries, so a 401 or a network blip costs one test.
+                try:
+                    return await test_once(src, cand)
+                except Exception as e:                  # noqa: BLE001
+                    msg = getattr(e, "detail", None) or str(e)
+                    job["testLog"].append({"t": round(time.time(), 1), "src": src, "cand": cand,
+                                           "verdict": "error", "detail": str(msg)[:300]})
+                    job["errors"] = job.get("errors", 0) + 1
+                    eng.say(f"  {ce.fname(cand)}: error, will retry: {str(msg)[:160]}")
+                    await asyncio.sleep(5)
+                    return "error"
+
+            async def test_once(src, cand):
                 await fms._refresh()
                 src_name = f"{req.stem}-{ce.fname(src)}"
                 cand_name = f"{req.stem}-{ce.fname(cand)}"
@@ -345,7 +391,9 @@ def make_router(valid_token, check_key, tone, live_tone: bool) -> APIRouter:
         out.update(pace={k: job["pace"][k] for k in ("toneS", "leadS", "auto")},
                    appVersion=job.get("appVersion", ""), relayVersion=RELAY_VERSION)
         out.update(done=len(res), counts=counts, tests=eng.tests, rtuSeconds=round(job["rtuSeconds"]),
-                   current=eng.current, candidate=eng.candidate, now=time.time())
+                   current=eng.current, candidate=eng.candidate, now=time.time(),
+                   resumeOf=job.get("resumeOf", ""), carried=job.get("carried", 0),
+                   testErrors=job.get("errors", 0))
         if full:
             out.update(eng.snapshot())
             out["settings"] = job["settings"]
