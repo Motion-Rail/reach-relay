@@ -199,7 +199,34 @@ class Fms:
         r.raise_for_status()
         return r.json()
 
-    def wait(self, wid: str, poll: float = 1.0, limit: float = 90) -> "Outcome":
+    def acquisition_start(self, wf: dict, sub_id: str | None, posted: float | None) -> tuple[float | None, list]:
+        """v20: when did the RTU actually start the OTDR, on the relay's clock?
+        The live fibre check happens at the start of acquisition, so this, not the time the
+        result came back, says whether the tone was still on. FMS (Conductor) stamps tasks in
+        epoch ms on its own clock; the parent workflow's startTime against the moment we posted
+        it gives the clock offset. The acquisition is taken as the longest task in the sub workflow.
+        Returns (local epoch seconds or None, a short task timeline for the logs)."""
+        try:
+            if not sub_id or not posted or not wf.get("startTime"):
+                return None, []
+            skew = wf["startTime"] / 1000.0 - posted
+            sub = self.workflow(sub_id, tasks=True)
+            tl, best = [], None
+            for t in sub.get("tasks", []):
+                st, en = t.get("startTime") or 0, t.get("endTime") or 0
+                if not st:
+                    continue
+                dur = (en - st) / 1000.0 if en else 0.0
+                tl.append({"ref": str(t.get("referenceTaskName") or t.get("taskType") or "")[:40],
+                           "type": str(t.get("taskType") or "")[:24],
+                           "startS": round(st / 1000.0 - skew - posted, 1), "durS": round(dur, 1)})
+                if best is None or dur > best[1]:
+                    best = (st / 1000.0 - skew, dur)
+            return (best[0] if best else None), tl[:12]
+        except Exception:                                   # noqa: BLE001
+            return None, []
+
+    def wait(self, wid: str, poll: float = 1.0, limit: float = 90, posted: float | None = None) -> "Outcome":
         t0 = time.time()
         while True:
             wf = self.workflow(wid)
@@ -215,8 +242,9 @@ class Fms:
         res = entries[0]
         r = res.get("result") or {}
         if r.get("status") == "COMPLETED":
+            acq, tl = self.acquisition_start(wf, res.get("subWorkflowId"), posted)
             return Outcome("clean", "OTDR completed " + str(r.get("linkLength", "")) + " m",
-                           secs, wid, raw=r)
+                           secs, wid, raw={**r, "acqStart": acq, "timeline": tl})
         reason = self.failure_detail(res.get("subWorkflowId")) or r.get("message") or "failed"
         verdict = "clash" if LIVE_PATTERNS.search(reason) else "failed"
         return Outcome(verdict, reason, secs, wid, raw=r)

@@ -35,6 +35,11 @@ import uuid
 from fastapi import APIRouter, HTTPException, Header
 from pydantic import BaseModel
 
+import base64
+import json
+
+import requests
+
 import continuity_engine as ce
 from fms_continuity import Fms, StartRefused
 
@@ -52,9 +57,10 @@ PACE = {                              # measured on RGAC2 -> SNBC, 28 Sep 2026
     "max_tone_s": 20,
     "cover_tone_s": 20,               # first test of a run, and a retry after a miss
     "slow_cycle_s": 25,               # a miss slower than this is an FMS delay, not a short tone
-    "late_margin_s": 15,              # v18: a dark result later than tone start + tone + this is rechecked
+    "late_margin_s": 25,              # v20 fallback only, when FMS task times are missing
+    "acq_margin_s": 1,                # v20: acquisition must start at least this long before the tone ends              # v18: a dark result later than tone start + tone + this is rechecked
 }
-RELAY_VERSION = "v18"
+RELAY_VERSION = "v20"
 JOBS: dict[str, dict] = {}
 LOCKS: dict[str, asyncio.Lock] = {}
 ROUTES: dict[str, dict[str, dict]] = {}          # rtuName -> {routeName: node}
@@ -125,6 +131,40 @@ class StartReq(BaseModel):
     resumeOf: str | None = None
 
 
+class FeedbackReq(BaseModel):
+    jobId: str
+    verdict: str                      # correct | partly | wrong
+    notes: str = ""
+    user: str = ""
+    appVersion: str = ""
+
+
+# v20: every finished run (and any feedback on it) is written to a private GitHub repo, so runs
+# can be reviewed and the search tuned. Off unless both are set on the relay.
+LOG_REPO = os.environ.get("LOG_REPO", "")            # e.g. Motion-Rail/relay-logs
+LOG_TOKEN = os.environ.get("LOG_TOKEN", "")          # fine grained token, contents read/write on LOG_REPO only
+LOG_API = os.environ.get("LOG_API", "https://api.github.com").rstrip("/")
+
+
+def _push_log_sync(path: str, body: dict, sha: str | None, message: str) -> tuple[str | None, str]:
+    url = f"{LOG_API}/repos/{LOG_REPO}/contents/{path}"
+    h = {"Authorization": "Bearer " + LOG_TOKEN, "Accept": "application/vnd.github+json",
+         "X-GitHub-Api-Version": "2022-11-28"}
+    data = {"message": message,
+            "content": base64.b64encode(json.dumps(body, indent=1, default=str).encode()).decode()}
+    if sha:
+        data["sha"] = sha
+    r = requests.put(url, headers=h, json=data, timeout=30)
+    if r.status_code == 409 or (r.status_code == 422 and not sha):     # stale or unknown sha: fetch and retry once
+        g = requests.get(url, headers=h, timeout=30)
+        if g.ok:
+            data["sha"] = g.json().get("sha")
+            r = requests.put(url, headers=h, json=data, timeout=30)
+    if r.ok:
+        return r.json().get("content", {}).get("sha"), "saved"
+    return sha, f"{r.status_code} {r.text[:160]}"
+
+
 class JobReq(BaseModel):
     jobId: str
     action: str | None = None
@@ -188,12 +228,15 @@ def make_router(valid_token, check_key, tone, live_tone: bool) -> APIRouter:
         async with LOCKS.setdefault(rtu, asyncio.Lock()):
             t0 = time.time()
             try:
+                posted = time.time()
                 wid = await asyncio.to_thread(fms.start_otdr, node["rtuId"], node["id"], name,
                                               duration=dur, range_m=80000, comment=comment)
             except StartRefused as e:
                 return {"verdict": "start_refused", "detail": str(e), "seconds": round(time.time() - t0, 1)}
-            out = await asyncio.to_thread(fms.wait, wid)
+            out = await asyncio.to_thread(fms.wait, wid, posted=posted)
         return {"verdict": out.verdict, "detail": out.detail[:600], "seconds": round(out.seconds, 1),
+                "acqStart": (out.raw or {}).get("acqStart"), "timeline": (out.raw or {}).get("timeline", []),
+                "posted": posted,
                 "workflowId": wid}
 
     # ---------------- single calls ----------------
@@ -337,7 +380,14 @@ def make_router(valid_token, check_key, tone, live_tone: bool) -> APIRouter:
                 v = res["verdict"]
                 # v18: a dark reading only counts if the tone was still on when the OTDR started.
                 # FMS sometimes starts late; then the tone has ended and "clean" proves nothing.
-                late = time.time() - tone_state.get("start", t0) > tone_state.get("len", tone_s) + PACE["late_margin_s"]
+                # v20: judge by when FMS started the acquisition (from its task times), not by when
+                # the result came back. A dark OTDR that is merely slow to finish is fine.
+                tone_end = tone_state.get("start", t0) + tone_state.get("len", tone_s)
+                acq = res.get("acqStart")
+                if acq:
+                    late = acq > tone_end - PACE["acq_margin_s"]
+                else:
+                    late = time.time() - tone_state.get("start", t0) > tone_state.get("len", tone_s) + PACE["late_margin_s"]
                 if v == "clean" and late and not recheck:
                     job["testLog"].append({"t": round(t0, 1), "src": src, "cand": cand, "verdict": "late",
                                            "otdrS": res.get("seconds"), "cycleS": round(time.time() - t0, 1),
@@ -351,6 +401,9 @@ def make_router(valid_token, check_key, tone, live_tone: bool) -> APIRouter:
                 job["testLog"].append({"t": round(t0, 1), "src": src, "cand": cand, "verdict": v,
                                        "otdrS": res.get("seconds"), "cycleS": round(time.time() - t0, 1),
                                        "toneS": tone_s, "leadS": lead_s, "workflow": res.get("workflowId", ""),
+                                       "acqAfterToneS": (round(res["acqStart"] - tone_state.get("start", t0), 1)
+                                                         if res.get("acqStart") else None),
+                                       "timeline": res.get("timeline", [])[:8] if len(job["testLog"]) < 60 else [],
                                        "detail": ("" if v in ("clash", "clean") else res.get("detail", "")[:300])})
                 del job["testLog"][:-5000]
                 # Auto pacing: the expected fibre read clean, then passed on the retry. The tone
@@ -391,6 +444,7 @@ def make_router(valid_token, check_key, tone, live_tone: bool) -> APIRouter:
                 eng.say("Run failed: " + job["error"])
             finally:
                 job["ended"] = time.time()
+                await save_log(job, "run " + job["state"])
 
         job["task"] = asyncio.create_task(runner())
         return {"ok": True, "jobId": jid}
@@ -409,7 +463,8 @@ def make_router(valid_token, check_key, tone, live_tone: bool) -> APIRouter:
         out.update(done=len(res), counts=counts, tests=eng.tests, rtuSeconds=round(job["rtuSeconds"]),
                    current=eng.current, candidate=eng.candidate, now=time.time(),
                    resumeOf=job.get("resumeOf", ""), carried=job.get("carried", 0),
-                   testErrors=job.get("errors", 0), lateRechecks=job.get("lateRechecks", 0))
+                   testErrors=job.get("errors", 0), lateRechecks=job.get("lateRechecks", 0),
+                   logSaved=job.get("logSaved", ""), feedback=job.get("feedback"))
         if full:
             out.update(eng.snapshot())
             out["settings"] = job["settings"]
@@ -443,14 +498,8 @@ def make_router(valid_token, check_key, tone, live_tone: bool) -> APIRouter:
             raise HTTPException(400, "action must be pause, resume or stop")
         return snap(job, False)
 
-    @router.post("/api/continuity/debug")
-    async def debug(req: JobReq, x_app_key: str | None = Header(default=None),
-                    x_session: str | None = Header(default=None)):
+    def report(job: dict) -> dict:
         """Everything needed to diagnose a run: every test with timings, pace changes, full log."""
-        check_key(x_app_key)
-        job = JOBS.get(req.jobId)
-        if not job:
-            raise HTTPException(404, "No such run")
         eng: ce.Engine = job["engine"]
         out = snap(job)
         out["log"] = eng.log[-400:]
@@ -463,7 +512,47 @@ def make_router(valid_token, check_key, tone, live_tone: bool) -> APIRouter:
                          "cleanAvgS": _avg([t["otdrS"] for t in job["testLog"] if t["verdict"] == "clean" and t.get("otdrS")]),
                          "elapsedS": round((job["ended"] or time.time()) - job["started"])}
         out["excluded"] = os.environ.get("CONTINUITY_EXCLUDE", "")
+        out["feedback"] = job.get("feedback")
         return out
+
+    async def save_log(job: dict, why: str):
+        if not (LOG_REPO and LOG_TOKEN) or job.get("simulate"):
+            job["logSaved"] = "off" if not (LOG_REPO and LOG_TOKEN) else "simulation, not saved"
+            return
+        if not job.get("logPath"):
+            day = time.strftime("%Y-%m-%d", time.gmtime(job["started"]))
+            rib = "R" + "-".join(str(r) for r in job["ribbons"][:6]) + ("+" if len(job["ribbons"]) > 6 else "")
+            job["logPath"] = f"runs/{day}/{day}_{time.strftime('%H%M', time.gmtime(job['started']))}_{job['stem']}_{rib}_{job['id'][:8]}.json"
+        try:
+            sha, st = await asyncio.to_thread(_push_log_sync, job["logPath"], report(job), job.get("logSha"),
+                                              f"{why}: {job['stem']} {job['state']}")
+            job["logSha"], job["logSaved"] = sha, st
+        except Exception as e:                              # noqa: BLE001
+            job["logSaved"] = "error: " + str(e)[:160]
+
+    @router.post("/api/continuity/debug")
+    async def debug(req: JobReq, x_app_key: str | None = Header(default=None),
+                    x_session: str | None = Header(default=None)):
+        check_key(x_app_key)
+        job = JOBS.get(req.jobId)
+        if not job:
+            raise HTTPException(404, "No such run")
+        return report(job)
+
+    @router.post("/api/continuity/feedback")
+    async def feedback(req: FeedbackReq, x_app_key: str | None = Header(default=None),
+                       x_session: str | None = Header(default=None)):
+        """v20: the tester says whether the result matched what is on site."""
+        check_key(x_app_key)
+        job = JOBS.get(req.jobId)
+        if not job:
+            raise HTTPException(404, "That run is no longer on the relay")
+        if req.verdict not in ("correct", "partly", "wrong"):
+            raise HTTPException(400, "verdict must be correct, partly or wrong")
+        job["feedback"] = {"verdict": req.verdict, "notes": req.notes[:2000], "user": req.user[:120],
+                           "appVersion": req.appVersion, "t": round(time.time(), 1)}
+        await save_log(job, "feedback")
+        return {"ok": True, "logSaved": job.get("logSaved", "")}
 
     @router.post("/api/continuity/jobs")
     async def jobs(x_app_key: str | None = Header(default=None)):
