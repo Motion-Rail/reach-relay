@@ -70,7 +70,7 @@ class Hyp:
 
 @dataclass
 class Result:
-    state: str                   # straight | cross | unres
+    state: str                   # straight | cross | dis | unres
     found: int = 0
     tests: int = 0
     why: str = ""
@@ -181,10 +181,12 @@ class Engine:
         self.say("pattern learned: " + h.label)
 
     # ---- one source fibre ----
-    async def run_one(self, f: int, test, opts: Options, control) -> Result | None:
+    async def run_one(self, f: int, test, opts: Options, control, skip_expected: bool = False) -> Result | None:
         used = 0
         self.current = f
         for cand, why in self.ladder(f, opts):
+            if skip_expected and why == "expected":
+                continue
             if used >= opts.max_tests:
                 break
             retries = opts.retry_straight if why == "expected" else opts.retry_other
@@ -223,12 +225,182 @@ class Engine:
             self.say(f"{fname(f)} {rplabel(f)} CROSS to {fname(res.found)} {rplabel(res.found)} ({res.why})")
             if self.opts.learn:
                 self.learn_from(f, res.found)
+        elif res.state == "dis":
+            self.say(f"{fname(f)} {rplabel(f)} DIS, {res.why} ({res.tests} tests)")
         else:
             self.say(f"{fname(f)} {rplabel(f)} NOT FOUND after {res.tests} tests")
         self.hyp = [h for h in self.hyp if h.miss < 3]
 
+    # ---- v18: ribbon by ribbon, physical fault logic ----
+    async def _t(self, src, cand, test, control, long=False):
+        if not await control():
+            return None
+        self.tests += 1
+        self.candidate = cand
+        return await test(src, cand, long=long)
+
+    async def _hit(self, src, cand, test, control, tries=2, long=True):
+        """True if cand is live while src is toned, in up to `tries` attempts. None if stopped."""
+        for _ in range(tries):
+            r = await self._t(src, cand, test, control, long=long)
+            if r is None:
+                return None
+            if r == "clash":
+                return True
+        return False
+
+    def _unclaimed(self, r: int, targets: set[int]) -> list[int]:
+        return [gf(r, p) for p in range(1, PER + 1)
+                if gf(r, p) in targets and gf(r, p) not in self.used_far]
+
+    async def _swap_check(self, a: int, b: int, test, control, targets: set[int], counts: dict) -> bool | None:
+        """a was found on b. If b is an untested or unresolved source, test b on a straight away."""
+        if b not in targets or b in self.results or a in self.used_far:
+            return False
+        self.current = b
+        self.say(f"  {fname(a)} lands on {fname(b)}: checking {fname(b)} on {fname(a)} (swap)")
+        n0 = self.tests
+        hit = await self._hit(b, a, test, control)
+        if hit is None:
+            return None
+        if hit:
+            self.record(b, Result("cross", a, self.tests - n0 + counts.get(b, 0), f"swapped with {fname(a)}"))
+            return True
+        return False
+
+    async def run_ribbon(self, r: int, fibres: list[int], test, control, targets: set[int]) -> bool:
+        counts: dict[int, int] = {}
+        pending: list[int] = []
+        # 1. straight pass: every fibre on its own position, one retry with a long tone
+        for f in fibres:
+            if f in self.results:
+                continue
+            self.current = f
+            n0 = self.tests
+            res = await self._t(f, f, test, control)
+            if res is None:
+                return False
+            if res != "clash":
+                res = await self._t(f, f, test, control, long=True)
+                if res is None:
+                    return False
+            counts[f] = self.tests - n0
+            if res == "clash":
+                self.record(f, Result("straight", f, counts[f], "expected"))
+            else:
+                pending.append(f)
+                self.say(f"  {fname(f)} {rplabel(f)} dark on its own position, will search after the ribbon")
+        straight = sum(1 for f in fibres if self.results.get(f) and self.results[f].state == "straight")
+        # 2. gaps: pending sources against unclaimed far ends in this ribbon
+        if pending and straight:
+            for f in pending:
+                if f in self.results:
+                    continue
+                self.current = f
+                n0 = self.tests
+                found = 0
+                gaps = sorted(self._unclaimed(r, targets), key=lambda g: (abs(g - f), g))
+                gaps = [g for g in gaps if g != f]
+                for g in gaps:
+                    if g in self.used_far:
+                        continue
+                    hit = await self._hit(f, g, test, control, tries=1)
+                    if hit is None:
+                        return False
+                    if hit:
+                        found = g
+                        break
+                counts[f] = counts.get(f, 0) + self.tests - n0
+                if found:
+                    self.record(f, Result("cross", found, counts[f], "gap in ribbon"))
+                    sw = await self._swap_check(f, found, test, control, targets, counts)
+                    if sw is None:
+                        return False
+                    continue
+                # 3. not on any free far end in its ribbon, rest of the ribbon is in place: DIS after rechecks
+                self.say(f"  {fname(f)} not on any free far end in R{r}; rechecking its own position")
+                n0 = self.tests
+                hit = await self._hit(f, f, test, control, tries=2)
+                if hit is None:
+                    return False
+                counts[f] += self.tests - n0
+                if hit:
+                    self.record(f, Result("straight", f, counts[f], "expected, on recheck"))
+                else:
+                    self.record(f, Result("dis", 0, counts[f],
+                                          f"no light at the far end; {straight} of R{r} straight"))
+        elif pending:
+            # 4. nothing in this ribbon is straight: the ribbon itself is crossed, use the full ladder
+            self.say(f"R{r}: no fibre straight, searching neighbouring ribbons and bundles")
+            for f in pending:
+                if f in self.results:
+                    continue
+                res = await self.run_one(f, test, self.opts, control, skip_expected=True)
+                if res is None:
+                    return False
+                res.tests += counts.get(f, 0)
+                self.record(f, res)
+                if res.state == "cross":
+                    sw = await self._swap_check(f, res.found, test, control, targets, counts)
+                    if sw is None:
+                        return False
+        return True
+
     async def run(self, targets: list[int], test, control) -> bool:
         """Returns False if stopped."""
+        tset = set(targets)
+        ribbons: dict[int, list[int]] = {}
+        for f in targets:
+            ribbons.setdefault(rp(f)[0], []).append(f)
+        for r in sorted(ribbons):
+            if not await self.run_ribbon(r, ribbons[r], test, control, tset):
+                return False
+        # 5. second pass for fibres the ladder could not place (crossed ribbons only)
+        left = [f for f in targets if self.results.get(f) and self.results[f].state == "unres"]
+        if left:
+            self.say(f"Second pass over {len(left)} fibre{'s' if len(left) != 1 else ''}")
+            o2 = Options(**{**self.opts.__dict__,
+                            "retry_other": self.opts.retry_other + 1,
+                            "max_tests": self.opts.max_tests + 80,
+                            "deep": "bundle" if self.opts.deep != "stop" else "stop"})
+            for f in left:
+                old = self.results.pop(f)
+                res = await self.run_one(f, test, o2, control, skip_expected=True)
+                if res is None:
+                    self.results[f] = old
+                    return False
+                res.tests += old.tests
+                self.record(f, res, ", second pass")
+        # 6. leftovers: DIS or unresolved sources against unclaimed far ends in other tested ribbons
+        left = [f for f in targets if self.results.get(f) and self.results[f].state in ("dis", "unres")]
+        free = [g for g in targets if g not in self.used_far
+                and any(rp(g)[0] != rp(f)[0] for f in left)]
+        if left and free:
+            self.say(f"Leftovers: {len(left)} fibre{'s' if len(left) != 1 else ''} against "
+                     f"{len(free)} free far end{'s' if len(free) != 1 else ''} in other ribbons")
+            budget = 40 + 12 * len(left)
+            for f in left:
+                self.current = f
+                pred = [self.apply(h, f) for h in self.hyp]
+                order = [g for g in pred if g in free] + sorted(free, key=lambda g: (abs(g - f), g))
+                seen = set()
+                for g in order:
+                    if g in seen or g in self.used_far or rp(g)[0] == rp(f)[0] or budget <= 0:
+                        continue
+                    seen.add(g)
+                    budget -= 1
+                    hit = await self._hit(f, g, test, control, tries=1)
+                    if hit is None:
+                        return False
+                    if hit:
+                        old = self.results.pop(f)
+                        self.record(f, Result("cross", g, old.tests + len(seen), "found in leftovers check"))
+                        break
+        self.current = self.candidate = 0
+        return True
+
+    async def run_classic(self, targets: list[int], test, control) -> bool:
+        """The v12 to v17 search, kept for comparison and the simulator tests."""
         for f in targets:
             if f in self.results:
                 continue
@@ -320,11 +492,11 @@ def sim_tester(truth: dict[int, int], miss_rate: float = 0.0, delay: float = 0.0
     import random
     rnd = random.Random(seed)
 
-    async def test(src, cand):
+    async def test(src, cand, long=False):
         if delay:
             await asyncio.sleep(delay)
-        hit = truth[src] == cand
-        if hit and rnd.random() < miss_rate:
+        hit = truth.get(src) == cand
+        if hit and rnd.random() < (miss_rate / 4 if long else miss_rate):
             return "clean"
         return "clash" if hit else "clean"
     return test

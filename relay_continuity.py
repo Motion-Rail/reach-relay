@@ -52,8 +52,9 @@ PACE = {                              # measured on RGAC2 -> SNBC, 28 Sep 2026
     "max_tone_s": 20,
     "cover_tone_s": 20,               # first test of a run, and a retry after a miss
     "slow_cycle_s": 25,               # a miss slower than this is an FMS delay, not a short tone
+    "late_margin_s": 15,              # v18: a dark result later than tone start + tone + this is rechecked
 }
-RELAY_VERSION = "v17"
+RELAY_VERSION = "v18"
 JOBS: dict[str, dict] = {}
 LOCKS: dict[str, asyncio.Lock] = {}
 ROUTES: dict[str, dict[str, dict]] = {}          # rtuName -> {routeName: node}
@@ -249,11 +250,12 @@ def make_router(valid_token, check_key, tone, live_tone: bool) -> APIRouter:
                 f, st = int(k), v.get("state")
             except Exception:                           # noqa: BLE001
                 continue
-            if st in ("straight", "cross") and f in targets:
-                found = int(v.get("found") or f)
+            if st in ("straight", "cross", "dis") and f in targets:
+                found = int(v.get("found") or 0) if st == "dis" else int(v.get("found") or f)
                 eng.results[f] = ce.Result(st, found, int(v.get("tests") or 0),
                                            (v.get("why") or "") + " (earlier run)")
-                eng.used_far.add(found)
+                if found:
+                    eng.used_far.add(found)
         jid = uuid.uuid4().hex
         job = {"id": jid, "state": "running", "simulate": req.simulate or "", "stem": req.stem,
                "toneRtu": req.toneRtu, "testRtu": req.testRtu, "ribbons": sorted(set(req.ribbons)),
@@ -274,8 +276,8 @@ def make_router(valid_token, check_key, tone, live_tone: bool) -> APIRouter:
             job["truthNotes"] = notes
             base = ce.sim_tester(truth, miss_rate=0.05, delay=0.25)
 
-            async def test(src, cand):
-                r = await base(src, cand)
+            async def test(src, cand, long=False):
+                r = await base(src, cand, long=long)
                 job["rtuSeconds"] += PACE["clash_s"] if r == "clash" else PACE["clean_s"]
                 job["testLog"].append({"t": round(time.time(), 1), "src": src, "cand": cand, "verdict": r})
                 return r
@@ -287,11 +289,11 @@ def make_router(valid_token, check_key, tone, live_tone: bool) -> APIRouter:
             missed = set()                                  # sources whose own fibre read clean once
             pace = job["pace"]
 
-            async def test(src, cand):
+            async def test(src, cand, long=False):
                 # v17: nothing inside one test may end the run. Any fault is logged as an
                 # error and the engine retries, so a 401 or a network blip costs one test.
                 try:
-                    return await test_once(src, cand)
+                    return await test_once(src, cand, long)
                 except Exception as e:                  # noqa: BLE001
                     msg = getattr(e, "detail", None) or str(e)
                     job["testLog"].append({"t": round(time.time(), 1), "src": src, "cand": cand,
@@ -301,7 +303,7 @@ def make_router(valid_token, check_key, tone, live_tone: bool) -> APIRouter:
                     await asyncio.sleep(5)
                     return "error"
 
-            async def test_once(src, cand):
+            async def test_once(src, cand, long=False, recheck=False):
                 await fms._refresh()
                 src_name = f"{req.stem}-{ce.fname(src)}"
                 cand_name = f"{req.stem}-{ce.fname(cand)}"
@@ -310,7 +312,7 @@ def make_router(valid_token, check_key, tone, live_tone: bool) -> APIRouter:
                 # v15: the first test of a run and the retry of a fibre that missed get a long
                 # tone. Field runs: every miss so far followed a slow FMS start (cycle 36-66 s),
                 # so the extra cover goes where the risk is, not on every fibre.
-                if not job["testLog"] or (cand == src and src in missed):
+                if long or not job["testLog"] or (cand == src and src in missed):
                     tone_s = max(tone_s, PACE["cover_tone_s"])
                 need = max(1, min(13, tone_s - lead_s - 1))  # tone must still be on at the live check
                 if tone_state["src"] != src or tone_state["until"] - time.time() < need:
@@ -327,12 +329,25 @@ def make_router(valid_token, check_key, tone, live_tone: bool) -> APIRouter:
                         return "error"
                     if t.get("simulated"):
                         raise RuntimeError("Relay tone is simulated (LIVE_TONE=0)")
-                    tone_state.update(src=src, until=time.time() + tone_s)
+                    tone_state.update(src=src, until=time.time() + tone_s, start=time.time(), len=tone_s)
                     await asyncio.sleep(lead_s)
                 res = await run_otdr(fms, req.testRtu, cand_name, req.otdrS,
                                      f"continuity {ce.fname(src)} to {ce.fname(cand)}")
                 job["rtuSeconds"] += res.get("seconds", 0)
                 v = res["verdict"]
+                # v18: a dark reading only counts if the tone was still on when the OTDR started.
+                # FMS sometimes starts late; then the tone has ended and "clean" proves nothing.
+                late = time.time() - tone_state.get("start", t0) > tone_state.get("len", tone_s) + PACE["late_margin_s"]
+                if v == "clean" and late and not recheck:
+                    job["testLog"].append({"t": round(t0, 1), "src": src, "cand": cand, "verdict": "late",
+                                           "otdrS": res.get("seconds"), "cycleS": round(time.time() - t0, 1),
+                                           "toneS": tone_s, "leadS": lead_s, "workflow": res.get("workflowId", ""),
+                                           "detail": "dark after a late FMS start, rechecking with a long tone"})
+                    job["lateRechecks"] = job.get("lateRechecks", 0) + 1
+                    eng.say(f"  {ce.fname(src)} on {ce.fname(cand)}: dark but FMS started late "
+                            f"({round(time.time() - t0)} s), rechecking with a {PACE['cover_tone_s']} s tone")
+                    tone_state["until"] = 0                 # force a fresh tone
+                    return await test_once(src, cand, True, True)
                 job["testLog"].append({"t": round(t0, 1), "src": src, "cand": cand, "verdict": v,
                                        "otdrS": res.get("seconds"), "cycleS": round(time.time() - t0, 1),
                                        "toneS": tone_s, "leadS": lead_s, "workflow": res.get("workflowId", ""),
@@ -385,6 +400,7 @@ def make_router(valid_token, check_key, tone, live_tone: bool) -> APIRouter:
         res = eng.results
         counts = {"straight": sum(r.state == "straight" for r in res.values()),
                   "cross": sum(r.state == "cross" for r in res.values()),
+                  "dis": sum(r.state == "dis" for r in res.values()),
                   "unres": sum(r.state == "unres" for r in res.values())}
         out = {k: job[k] for k in ("id", "state", "simulate", "stem", "toneRtu", "testRtu", "ribbons",
                                    "targets", "started", "ended", "error", "truthNotes")}
@@ -393,7 +409,7 @@ def make_router(valid_token, check_key, tone, live_tone: bool) -> APIRouter:
         out.update(done=len(res), counts=counts, tests=eng.tests, rtuSeconds=round(job["rtuSeconds"]),
                    current=eng.current, candidate=eng.candidate, now=time.time(),
                    resumeOf=job.get("resumeOf", ""), carried=job.get("carried", 0),
-                   testErrors=job.get("errors", 0))
+                   testErrors=job.get("errors", 0), lateRechecks=job.get("lateRechecks", 0))
         if full:
             out.update(eng.snapshot())
             out["settings"] = job["settings"]
