@@ -50,7 +50,7 @@ MEAS_PAYLOAD_TEMPLATE = os.getenv(
 SETUP_NAME  = os.getenv("SETUP_NAME", "")
 PAGE_SIZE   = int(os.getenv("PAGE_SIZE", "50"))
 
-RELAY_VERSION = "v21"
+RELAY_VERSION = "v22"
 
 # ── relay access ─────────────────────────────────────────────────────────────
 APP_KEY    = os.getenv("APP_KEY", "")
@@ -251,7 +251,12 @@ class ToneIn(BaseModel):
 # ── endpoints ───────────────────────────────────────────────────────────────────
 @app.get("/health")
 async def health():
-    return {"ok": True, "version": RELAY_VERSION, "origins": ALLOWED_ORIGINS, "auth_host": AUTH_BASE, "topo_host": TOPO_HOST,
+    try:
+        from relay_continuity import FMS_STATUS
+        fms = {k: FMS_STATUS[k] for k in ("ok", "since", "detail")}
+    except Exception:                                   # noqa: BLE001
+        fms = {"ok": True, "since": 0, "detail": ""}
+    return {"ok": True, "version": RELAY_VERSION, "fms": fms, "origins": ALLOWED_ORIGINS, "auth_host": AUTH_BASE, "topo_host": TOPO_HOST,
             "graphql": GRAPHQL_URL, "tone": "live" if LIVE_TONE else "simulated",
             "tone_id_field": TONE_ID_FIELD, "cached": len(ROUTE_ID_CACHE), "rtus": len(RTU_INDEX), "client": CLIENT_ID}
 

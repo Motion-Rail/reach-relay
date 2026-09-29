@@ -59,9 +59,12 @@ PACE = {                              # measured on RGAC2 -> SNBC, 28 Sep 2026
     "cover_tone_s": 20,               # first test of a run, and a retry after a miss
     "slow_cycle_s": 25,               # a miss slower than this is an FMS delay, not a short tone
     "late_margin_s": 25,              # v20 fallback only, when FMS task times are missing
-    "acq_margin_s": 1,                # v20: acquisition must start at least this long before the tone ends              # v18: a dark result later than tone start + tone + this is rechecked
+    "acq_margin_s": 1,
+    "dis_otdr_s": 30,                 # v22: one long OTDR on each DIS fibre, for an accurate distance
+    "outage_wait_s": 60,              # v22: FMS not answering: wait, then retry the same test
+    "outage_limit_s": 7200,           #      give up (run fails, resumable) after 2 h                # v20: acquisition must start at least this long before the tone ends              # v18: a dark result later than tone start + tone + this is rechecked
 }
-RELAY_VERSION = "v21"
+RELAY_VERSION = "v22"
 JOBS: dict[str, dict] = {}
 LOCKS: dict[str, asyncio.Lock] = {}
 ROUTES: dict[str, dict[str, dict]] = {}          # rtuName -> {routeName: node}
@@ -131,6 +134,31 @@ class StartReq(BaseModel):
     prior: dict[str, dict] | None = None   # v17 resume: {"12": {"state": "straight", "found": 12}}
     user: str = ""
     resumeOf: str | None = None
+
+
+class FmsDown(Exception):
+    """v22: FMS itself is not answering (5xx, hung workflows). Not a fibre result."""
+
+
+# v22: last known state of FMS, from real tone / OTDR calls. Shown on /health and in the app.
+FMS_STATUS = {"ok": True, "t": 0.0, "detail": "", "since": 0.0}
+
+
+def fms_ok():
+    if not FMS_STATUS["ok"]:
+        FMS_STATUS.update(ok=True, detail="", since=0.0)
+    FMS_STATUS["t"] = time.time()
+
+
+def fms_bad(detail: str):
+    if FMS_STATUS["ok"]:
+        FMS_STATUS["since"] = time.time()
+    FMS_STATUS.update(ok=False, t=time.time(), detail=detail[:200])
+
+
+def _is_outage(text: str) -> bool:
+    return bool(re.search(r"\b50[0234]\b|Service Temporarily Unavailable|Bad Gateway|Gateway Time|timed? ?out|"
+                          r"Connection (?:reset|refused|aborted)|RemoteDisconnected|Max retries", str(text), re.I))
 
 
 def _num(v):
@@ -393,11 +421,59 @@ def make_router(valid_token, check_key, tone, live_tone: bool) -> APIRouter:
             missed = set()                                  # sources whose own fibre read clean once
             pace = job["pace"]
 
+            async def measure_dis(f):
+                """v22: one long OTDR on a DIS fibre for an accurate distance to its open end."""
+                name = f"{req.stem}-{ce.fname(f)}"
+                try:
+                    eng.say(f"  {ce.fname(f)}: measuring where it stops ({PACE['dis_otdr_s']} s OTDR)")
+                    res = await run_otdr(fms, req.testRtu, name, PACE["dis_otdr_s"], f"continuity DIS distance {ce.fname(f)}")
+                    job["testLog"].append({"t": round(time.time(), 1), "src": f, "cand": f, "verdict": "dis-" + res["verdict"],
+                                           "otdrS": res.get("seconds"), "lenM": res.get("lenM"),
+                                           "workflow": res.get("workflowId", ""), "detail": res.get("detail", "")[:200]})
+                    if res["verdict"] == "clean" and res.get("lenM"):
+                        job.setdefault("disLen", {})[f] = res["lenM"]
+                        fms_ok()
+                except Exception as e:                      # noqa: BLE001
+                    eng.say(f"  {ce.fname(f)}: distance measurement failed ({str(e)[:100]})")
+            eng.after_dis = measure_dis
+
             async def test(src, cand, long=False):
                 # v17: nothing inside one test may end the run. Any fault is logged as an
                 # error and the engine retries, so a 401 or a network blip costs one test.
+                # v22: when FMS itself is down the run waits and retries the same test, so an
+                # outage never turns into dark readings and false DIS results.
                 try:
-                    return await test_once(src, cand, long)
+                    while True:
+                        try:
+                            try:
+                                r = await test_once(src, cand, long)
+                            except (FmsDown, RuntimeError):
+                                raise
+                            except Exception as e2:     # noqa: BLE001
+                                if _is_outage(getattr(e2, "detail", None) or str(e2)):
+                                    raise FmsDown(str(getattr(e2, "detail", None) or e2)[:160])
+                                raise
+                            if job.get("fmsDown"):
+                                eng.say(f"FMS answering again after {round((time.time() - job['fmsDown']['since']) / 60)} min; carrying on.")
+                                job["fmsDown"] = None
+                            return r
+                        except FmsDown as e:
+                            fms_bad(str(e))
+                            if not job.get("fmsDown"):
+                                job["fmsDown"] = {"since": time.time(), "reason": str(e)[:200], "retries": 0}
+                                eng.say(f"FMS not responding ({str(e)[:100]}). Retrying in 15 s, then every "
+                                        f"{PACE['outage_wait_s']} s; nothing is marked until it answers.")
+                            job["fmsDown"]["retries"] += 1
+                            job["fmsDown"]["reason"] = str(e)[:200]
+                            if time.time() - job["fmsDown"]["since"] > PACE["outage_limit_s"]:
+                                raise RuntimeError("FMS has not answered for 2 hours. Resume the run when it is back.")
+                            for _ in range(15 if job["fmsDown"]["retries"] == 1 else PACE["outage_wait_s"]):
+                                if job["state"] == "stopped":
+                                    return "error"
+                                await asyncio.sleep(1)
+                            tone_state["until"] = 0
+                except RuntimeError:
+                    raise
                 except Exception as e:                  # noqa: BLE001
                     msg = getattr(e, "detail", None) or str(e)
                     job["testLog"].append({"t": round(time.time(), 1), "src": src, "cand": cand,
@@ -428,6 +504,8 @@ def make_router(valid_token, check_key, tone, live_tone: bool) -> APIRouter:
                         t = await tone(x_session, src_name, str(node["rtuId"]),
                                        req.wavelengthNm, tone_s, req.freqHz, str(node["id"]))
                     except HTTPException as e:
+                        if _is_outage(e.detail) or e.status_code >= 500:
+                            raise FmsDown(f"tone refused by FMS: {str(e.detail)[:120]}")
                         eng.say(f"  tone failed on {ce.fname(src)}: {e.detail}")
                         await asyncio.sleep(5)
                         return "error"
@@ -439,6 +517,14 @@ def make_router(valid_token, check_key, tone, live_tone: bool) -> APIRouter:
                                      f"continuity {ce.fname(src)} to {ce.fname(cand)}")
                 job["rtuSeconds"] += res.get("seconds", 0)
                 v = res["verdict"]
+                # v22: an OTDR that hangs, gives no output, or a 5xx on start is FMS failing, not a fibre result
+                if v in ("timeout", "unknown") or (v == "start_refused" and _is_outage(res.get("detail", ""))):
+                    job["testLog"].append({"t": round(t0, 1), "src": src, "cand": cand, "verdict": "fms-" + v,
+                                           "otdrS": res.get("seconds"), "cycleS": round(time.time() - t0, 1),
+                                           "workflow": res.get("workflowId", ""), "detail": res.get("detail", "")[:200]})
+                    raise FmsDown(f"OTDR {v}: {res.get('detail', '')[:120]}")
+                if v in ("clash", "clean"):
+                    fms_ok()
                 # v18: a dark reading only counts if the tone was still on when the OTDR started.
                 # FMS sometimes starts late; then the tone has ended and "clean" proves nothing.
                 # v20: judge by when FMS started the acquisition (from its task times), not by when
@@ -530,7 +616,8 @@ def make_router(valid_token, check_key, tone, live_tone: bool) -> APIRouter:
                    testErrors=job.get("errors", 0), lateRechecks=job.get("lateRechecks", 0),
                    logSaved=job.get("logSaved", ""), feedback=job.get("feedback"),
                    notified=job.get("notified", ""), restored=bool(job.get("restored")),
-                   resumedAs=job.get("resumedAs", ""))
+                   resumedAs=job.get("resumedAs", ""), fmsDown=job.get("fmsDown"),
+                   fms={k: FMS_STATUS[k] for k in ("ok", "since", "detail")})
         if full:
             out.update(eng.snapshot())
             out["settings"] = job["settings"]
@@ -544,12 +631,17 @@ def make_router(valid_token, check_key, tone, live_tone: bool) -> APIRouter:
     def dis_location(job: dict, f: int) -> dict | None:
         if f in job.get("locs", {}):
             return job["locs"][f]
+        if f in job.get("disLen", {}):                       # v22: the long OTDR reading
+            loc = bl.locate(job["stem"], job["testRtu"], f, job["disLen"][f])
+            loc["method"] = f"{PACE['dis_otdr_s']} s OTDR"
+            return loc
         lens = sorted(t["lenM"] for t in job["testLog"]
                       if t.get("src") == f and t.get("cand") == f and t.get("verdict") == "clean" and t.get("lenM"))
         if not lens:
             return None
-        loc = bl.locate(job["stem"], job["testRtu"], f, lens[len(lens) // 2])
+        loc = bl.locate(job["stem"], job["testRtu"], f, lens[len(lens) // 2], approx=True)
         loc["readings"] = len(lens)
+        loc["method"] = "3 s OTDR"
         return loc
 
     @router.post("/api/continuity/status")

@@ -86,6 +86,7 @@ class Engine:
     log: list[str] = field(default_factory=list)
     current: int = 0
     candidate: int = 0
+    after_dis: object = None      # v22: async hook(f) run once a fibre is marked DIS (relay measures its length)
 
     def say(self, msg: str):
         self.log.append(time.strftime("%H:%M:%S ") + msg)
@@ -329,6 +330,8 @@ class Engine:
                 else:
                     self.record(f, Result("dis", 0, counts[f],
                                           f"no light at the far end; {straight} of R{r} straight"))
+                    if self.after_dis:
+                        await self.after_dis(f)
         elif pending:
             # 4. nothing in this ribbon is straight: the ribbon itself is crossed, use the full ladder
             self.say(f"R{r}: no fibre straight, searching neighbouring ribbons and bundles")
