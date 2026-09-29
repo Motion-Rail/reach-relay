@@ -40,6 +40,7 @@ import json
 
 import requests
 
+import break_locator as bl
 import continuity_engine as ce
 from fms_continuity import Fms, StartRefused
 
@@ -60,7 +61,7 @@ PACE = {                              # measured on RGAC2 -> SNBC, 28 Sep 2026
     "late_margin_s": 25,              # v20 fallback only, when FMS task times are missing
     "acq_margin_s": 1,                # v20: acquisition must start at least this long before the tone ends              # v18: a dark result later than tone start + tone + this is rechecked
 }
-RELAY_VERSION = "v20"
+RELAY_VERSION = "v21"
 JOBS: dict[str, dict] = {}
 LOCKS: dict[str, asyncio.Lock] = {}
 ROUTES: dict[str, dict[str, dict]] = {}          # rtuName -> {routeName: node}
@@ -128,7 +129,15 @@ class StartReq(BaseModel):
     simulate: str | None = None       # testing only; not offered in the app since v14
     appVersion: str = ""
     prior: dict[str, dict] | None = None   # v17 resume: {"12": {"state": "straight", "found": 12}}
+    user: str = ""
     resumeOf: str | None = None
+
+
+def _num(v):
+    try:
+        return round(float(v), 1)
+    except (TypeError, ValueError):
+        return None
 
 
 class FeedbackReq(BaseModel):
@@ -163,6 +172,45 @@ def _push_log_sync(path: str, body: dict, sha: str | None, message: str) -> tupl
     if r.ok:
         return r.json().get("content", {}).get("sha"), "saved"
     return sha, f"{r.status_code} {r.text[:160]}"
+
+
+def _gh_headers() -> dict:
+    return {"Authorization": "Bearer " + LOG_TOKEN, "Accept": "application/vnd.github+json",
+            "X-GitHub-Api-Version": "2022-11-28"}
+
+
+def _gh_list_sync(path: str) -> list[dict]:
+    r = requests.get(f"{LOG_API}/repos/{LOG_REPO}/contents/{path}", headers=_gh_headers(), timeout=30)
+    return r.json() if r.ok and isinstance(r.json(), list) else []
+
+
+def _gh_get_sync(path: str) -> tuple[dict | None, str | None]:
+    r = requests.get(f"{LOG_API}/repos/{LOG_REPO}/contents/{path}", headers=_gh_headers(), timeout=30)
+    if not r.ok:
+        return None, None
+    j = r.json()
+    try:
+        return json.loads(base64.b64decode(j.get("content", ""))), j.get("sha")
+    except Exception:                                   # noqa: BLE001
+        return None, j.get("sha")
+
+
+# v21: a short message to a Teams channel when a run finishes. TEAMS_WEBHOOK is the URL of a
+# Teams Workflows "post to a channel when a webhook request is received" flow. Off when unset.
+TEAMS_WEBHOOK = os.environ.get("TEAMS_WEBHOOK", "")
+APP_URL = os.environ.get("APP_URL", "https://motionrail.onrender.com")
+
+
+def _teams_sync(title: str, lines: list[str]) -> str:
+    body = [{"type": "TextBlock", "text": title, "weight": "Bolder", "size": "Medium", "wrap": True}]
+    body += [{"type": "TextBlock", "text": t, "wrap": True, "spacing": "Small"} for t in lines]
+    card = {"type": "message", "attachments": [{
+        "contentType": "application/vnd.microsoft.card.adaptive",
+        "content": {"$schema": "http://adaptivecards.io/schemas/adaptive-card.json", "type": "AdaptiveCard",
+                    "version": "1.4", "body": body,
+                    "actions": [{"type": "Action.OpenUrl", "title": "Open Reach Fibre Tester", "url": APP_URL}]}}]}
+    r = requests.post(TEAMS_WEBHOOK, json=card, timeout=20)
+    return "sent" if r.status_code < 300 else f"{r.status_code} {r.text[:120]}"
 
 
 class JobReq(BaseModel):
@@ -236,7 +284,7 @@ def make_router(valid_token, check_key, tone, live_tone: bool) -> APIRouter:
             out = await asyncio.to_thread(fms.wait, wid, posted=posted)
         return {"verdict": out.verdict, "detail": out.detail[:600], "seconds": round(out.seconds, 1),
                 "acqStart": (out.raw or {}).get("acqStart"), "timeline": (out.raw or {}).get("timeline", []),
-                "posted": posted,
+                "posted": posted, "lenM": _num((out.raw or {}).get("linkLength")),
                 "workflowId": wid}
 
     # ---------------- single calls ----------------
@@ -287,7 +335,17 @@ def make_router(valid_token, check_key, tone, live_tone: bool) -> APIRouter:
         if not targets:
             raise HTTPException(400, "No fibres to test (none selected, or all excluded)")
 
+        fms = None
+        if not req.simulate:                    # v24: check the session before anything is created
+            fms = await fms_for(x_session)
+            await routes(fms, req.toneRtu)
+            await routes(fms, req.testRtu)
+        old = JOBS.get(req.resumeOf or "")
+        if old and old["state"] == "interrupted":
+            old["state"] = "resumed"
+            old["resumedAsPending"] = True
         eng = ce.Engine()
+        carried_locs: dict[int, dict] = {}
         for k, v in (req.prior or {}).items():          # v17: resume carries finished fibres over
             try:
                 f, st = int(k), v.get("state")
@@ -296,7 +354,9 @@ def make_router(valid_token, check_key, tone, live_tone: bool) -> APIRouter:
             if st in ("straight", "cross", "dis") and f in targets:
                 found = int(v.get("found") or 0) if st == "dis" else int(v.get("found") or f)
                 eng.results[f] = ce.Result(st, found, int(v.get("tests") or 0),
-                                           (v.get("why") or "") + " (earlier run)")
+                                           (v.get("why") or "").replace(" (earlier run)", "") + " (earlier run)")
+                if v.get("loc"):
+                    carried_locs[f] = v["loc"]
                 if found:
                     eng.used_far.add(found)
         jid = uuid.uuid4().hex
@@ -304,11 +364,15 @@ def make_router(valid_token, check_key, tone, live_tone: bool) -> APIRouter:
                "toneRtu": req.toneRtu, "testRtu": req.testRtu, "ribbons": sorted(set(req.ribbons)),
                "targets": len(targets), "started": time.time(), "ended": None, "rtuSeconds": 0.0,
                "error": "", "settings": req.model_dump(exclude={"prior"}), "engine": eng, "truthNotes": [],
-               "user": "", "pauseEvt": asyncio.Event(), "testLog": [],
+               "pauseEvt": asyncio.Event(), "testLog": [],
                "pace": {"toneS": req.toneS, "leadS": req.leadS, "auto": req.autoPace, "changes": []},
-               "appVersion": req.appVersion, "resumeOf": req.resumeOf or "", "carried": len(eng.results)}
+               "appVersion": req.appVersion, "resumeOf": req.resumeOf or "", "carried": len(eng.results),
+               "locs": carried_locs, "user": req.user or ""}
         job["pauseEvt"].set()
         JOBS[jid] = job
+        if old and old.pop("resumedAsPending", False):
+            old["resumedAs"] = jid
+            asyncio.create_task(save_log(old, "resumed"))
 
         async def control() -> bool:
             await job["pauseEvt"].wait()
@@ -325,9 +389,6 @@ def make_router(valid_token, check_key, tone, live_tone: bool) -> APIRouter:
                 job["testLog"].append({"t": round(time.time(), 1), "src": src, "cand": cand, "verdict": r})
                 return r
         else:
-            fms = await fms_for(x_session)
-            await routes(fms, req.toneRtu)
-            await routes(fms, req.testRtu)
             tone_state = {"src": 0, "until": 0.0}
             missed = set()                                  # sources whose own fibre read clean once
             pace = job["pace"]
@@ -401,6 +462,7 @@ def make_router(valid_token, check_key, tone, live_tone: bool) -> APIRouter:
                 job["testLog"].append({"t": round(t0, 1), "src": src, "cand": cand, "verdict": v,
                                        "otdrS": res.get("seconds"), "cycleS": round(time.time() - t0, 1),
                                        "toneS": tone_s, "leadS": lead_s, "workflow": res.get("workflowId", ""),
+                                       "lenM": res.get("lenM"),
                                        "acqAfterToneS": (round(res["acqStart"] - tone_state.get("start", t0), 1)
                                                          if res.get("acqStart") else None),
                                        "timeline": res.get("timeline", [])[:8] if len(job["testLog"]) < 60 else [],
@@ -445,8 +507,10 @@ def make_router(valid_token, check_key, tone, live_tone: bool) -> APIRouter:
             finally:
                 job["ended"] = time.time()
                 await save_log(job, "run " + job["state"])
+                await notify(job)
 
         job["task"] = asyncio.create_task(runner())
+        job["ckpt"] = asyncio.create_task(checkpointer(job))
         return {"ok": True, "jobId": jid}
 
     def snap(job: dict, full: bool = True) -> dict:
@@ -464,11 +528,29 @@ def make_router(valid_token, check_key, tone, live_tone: bool) -> APIRouter:
                    current=eng.current, candidate=eng.candidate, now=time.time(),
                    resumeOf=job.get("resumeOf", ""), carried=job.get("carried", 0),
                    testErrors=job.get("errors", 0), lateRechecks=job.get("lateRechecks", 0),
-                   logSaved=job.get("logSaved", ""), feedback=job.get("feedback"))
+                   logSaved=job.get("logSaved", ""), feedback=job.get("feedback"),
+                   notified=job.get("notified", ""), restored=bool(job.get("restored")),
+                   resumedAs=job.get("resumedAs", ""))
         if full:
             out.update(eng.snapshot())
             out["settings"] = job["settings"]
+            for k, r in out.get("results", {}).items():         # v21: where each DIS fibre stops
+                if r.get("state") == "dis":
+                    loc = dis_location(job, int(k))
+                    if loc:
+                        r["loc"] = loc
         return out
+
+    def dis_location(job: dict, f: int) -> dict | None:
+        if f in job.get("locs", {}):
+            return job["locs"][f]
+        lens = sorted(t["lenM"] for t in job["testLog"]
+                      if t.get("src") == f and t.get("cand") == f and t.get("verdict") == "clean" and t.get("lenM"))
+        if not lens:
+            return None
+        loc = bl.locate(job["stem"], job["testRtu"], f, lens[len(lens) // 2])
+        loc["readings"] = len(lens)
+        return loc
 
     @router.post("/api/continuity/status")
     async def status(req: JobReq, x_app_key: str | None = Header(default=None),
@@ -529,6 +611,93 @@ def make_router(valid_token, check_key, tone, live_tone: bool) -> APIRouter:
             job["logSha"], job["logSaved"] = sha, st
         except Exception as e:                              # noqa: BLE001
             job["logSaved"] = "error: " + str(e)[:160]
+
+    def summary_lines(job: dict) -> tuple[str, list[str]]:
+        s = snap(job)
+        c, res = s["counts"], s.get("results", {})
+        cable = re.sub(r"-R\d+$", "", job["stem"])
+        rib = ", ".join(f"R{r}" for r in job["ribbons"][:8]) + ("…" if len(job["ribbons"]) > 8 else "")
+        word = {"done": "complete", "stopped": "stopped", "error": "failed"}.get(job["state"], job["state"])
+        title = f"E2E {cable} {rib}: {word}"
+        mins = round(((job["ended"] or time.time()) - job["started"]) / 60)
+        lines = [f"{c['straight']} straight, {c['cross']} crossed, {c.get('dis', 0)} DIS"
+                 + (f", {c['unres']} not found" if c.get("unres") else "")
+                 + f" of {job['targets']} fibres. {s['tests']} tests, {mins} min."]
+        crosses = [f"F{int(k):03d} → F{v['found']:03d}" for k, v in res.items() if v["state"] == "cross"]
+        if crosses:
+            lines.append("Crossed: " + ", ".join(crosses[:12]) + ("…" if len(crosses) > 12 else ""))
+        for k, v in res.items():
+            if v["state"] == "dis":
+                lines.append(f"DIS F{int(k):03d}" + (f": {v['loc']['text']}" if v.get("loc") else ""))
+        if job.get("error"):
+            lines.append("Error: " + job["error"][:200])
+        if job.get("user"):
+            lines.append("Run by " + job["user"])
+        return title, lines[:20]
+
+    async def notify(job: dict):
+        if not TEAMS_WEBHOOK or job.get("simulate") or job["state"] not in ("done", "stopped", "error"):
+            return
+        try:
+            title, lines = summary_lines(job)
+            job["notified"] = await asyncio.to_thread(_teams_sync, title, lines)
+        except Exception as e:                              # noqa: BLE001
+            job["notified"] = "error: " + str(e)[:120]
+
+    async def checkpointer(job: dict):
+        """v21: save the run to the log store every minute, so a relay restart loses nothing."""
+        while job["state"] in ("running", "paused"):
+            await asyncio.sleep(60)
+            if job["state"] in ("running", "paused"):
+                await save_log(job, "checkpoint")
+
+    async def restore():
+        """v21: on start up, bring back runs that were in progress when the relay stopped. They come
+        back as 'interrupted' with every finished fibre; the app resumes them after sign in."""
+        if not (LOG_REPO and LOG_TOKEN):
+            return
+        try:
+            days = {time.strftime("%Y-%m-%d", time.gmtime(time.time() - d * 86400)) for d in (0, 1)}
+            for day in sorted(days):
+                for f in await asyncio.to_thread(_gh_list_sync, f"runs/{day}"):
+                    if not f.get("name", "").endswith(".json"):
+                        continue
+                    rep_, sha = await asyncio.to_thread(_gh_get_sync, f["path"])
+                    if not rep_ or rep_.get("state") not in ("running", "paused", "interrupted") or rep_.get("id") in JOBS:
+                        continue
+                    eng = ce.Engine()
+                    locs = {}
+                    for k, v in (rep_.get("results") or {}).items():
+                        eng.results[int(k)] = ce.Result(v["state"], v.get("found") or 0, v.get("tests") or 0, v.get("why") or "")
+                        if v.get("found"):
+                            eng.used_far.add(v["found"])
+                        if v.get("loc"):
+                            locs[int(k)] = v["loc"]
+                    eng.tests = rep_.get("tests") or 0
+                    eng.log = list(rep_.get("log") or [])[-80:]
+                    eng.say("Relay restarted. Run interrupted; resume carries every finished fibre over.")
+                    st = rep_.get("settings") or {}
+                    job = {"id": rep_["id"], "state": "interrupted", "simulate": "", "stem": rep_["stem"],
+                           "toneRtu": rep_["toneRtu"], "testRtu": rep_["testRtu"], "ribbons": rep_["ribbons"],
+                           "targets": rep_["targets"], "started": rep_["started"], "ended": time.time(),
+                           "rtuSeconds": rep_.get("rtuSeconds") or 0.0, "error": "The relay restarted during the run.",
+                           "settings": st, "engine": eng, "truthNotes": [], "pauseEvt": asyncio.Event(),
+                           "testLog": [], "pace": {**{"toneS": 10, "leadS": 2, "auto": True}, **(rep_.get("pace") or {}), "changes": []},
+                           "appVersion": rep_.get("appVersion", ""), "resumeOf": rep_.get("resumeOf", ""),
+                           "carried": rep_.get("carried", 0), "locs": locs, "user": st.get("user", ""),
+                           "logPath": f["path"], "logSha": sha, "restored": True}
+                    JOBS[job["id"]] = job
+                    await save_log(job, "restored after relay restart")
+        except Exception as e:                              # noqa: BLE001
+            print("restore failed:", e)
+
+    async def save_all():
+        for job in list(JOBS.values()):
+            if job["state"] in ("running", "paused"):
+                await save_log(job, "relay shutting down")
+
+    router.add_event_handler("startup", restore)
+    router.add_event_handler("shutdown", save_all)
 
     @router.post("/api/continuity/debug")
     async def debug(req: JobReq, x_app_key: str | None = Header(default=None),
