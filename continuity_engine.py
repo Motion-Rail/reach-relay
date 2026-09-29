@@ -87,6 +87,7 @@ class Engine:
     current: int = 0
     candidate: int = 0
     after_dis: object = None      # v22: async hook(f) run once a fibre is marked DIS (relay measures its length)
+    dark_ribbons: list = field(default_factory=list)   # v26: ribbons with no light at all
 
     def say(self, msg: str):
         self.log.append(time.strftime("%H:%M:%S ") + msg)
@@ -269,9 +270,88 @@ class Engine:
             return True
         return False
 
+    # ---- v26: whole ribbon dark ----
+    EARLY_DARK = 4
+
+    def _probe_candidates(self, r: int, f: int) -> list[tuple[int, str]]:
+        _, p = rp(f)
+        q = PER + 1 - p
+        out = []
+        for rr, pp, why in [(r, q, f"R{r} reversed"),
+                            (r - 1, p, f"R{r} crossed with R{r - 1}"), (r + 1, p, f"R{r} crossed with R{r + 1}"),
+                            (r - 1, q, f"R{r} crossed with R{r - 1}, reversed"), (r + 1, q, f"R{r} crossed with R{r + 1}, reversed"),
+                            (r + PERBUNDLE, p, f"bundle crossed: R{r} landing on R{r + PERBUNDLE} in the next bundle"),
+                            (r - PERBUNDLE, p, f"bundle crossed: R{r} landing on R{r - PERBUNDLE} in the previous bundle"),
+                            (r + PERBUNDLE, q, f"bundle crossed with R{r + PERBUNDLE}, reversed"),
+                            (r - PERBUNDLE, q, f"bundle crossed with R{r - PERBUNDLE}, reversed")]:
+            if 1 <= rr <= RIBBONS:
+                g = gf(rr, pp)
+                if g != f and g not in self.used_far:
+                    out.append((g, why))
+        return out
+
+    async def _ribbon_probe(self, r: int, f: int, test, control, counts: dict):
+        """Is the whole ribbon crossed? Try one fibre where a crossed ribbon or bundle would put it."""
+        side = ", ".join(f"R{x}" for x in (r - 1, r + 1) if 1 <= x <= RIBBONS)
+        bun = ", ".join(f"R{x}" for x in (r + PERBUNDLE, r - PERBUNDLE) if 1 <= x <= RIBBONS)
+        self.say(f"R{r}: checking whether the whole ribbon is crossed, using {fname(f)}. Order: R{r} reversed, "
+                 f"then the ribbon{'s' if ',' in side else ''} either side ({side}), then the same ribbon in the "
+                 f"neighbouring bundle ({bun}).")
+        self.current = f
+        n0 = self.tests
+        for g, why in self._probe_candidates(r, f):
+            self.say(f"  {fname(f)} on {fname(g)} {rplabel(g)}: {why}?")
+            hit = await self._hit(f, g, test, control, tries=1)
+            if hit is None:
+                return None
+            if hit:
+                counts[f] = counts.get(f, 0) + self.tests - n0
+                self.say(f"  found: {fname(f)} lands on {fname(g)}. {why[0].upper() + why[1:]}.")
+                return g, why
+        counts[f] = counts.get(f, 0) + self.tests - n0
+        self.say(f"  {fname(f)} is not in the reversed ribbon, the ribbons either side or the neighbouring bundles.")
+        return False
+
+    async def _apply_pattern(self, r: int, fibres: list[int], test, control, targets: set[int], counts: dict, why: str):
+        """A crossed ribbon or bundle is proven: test each remaining fibre where the pattern says first."""
+        self.say(f"R{r}: applying the pattern to the rest of the ribbon ({why}).")
+        for f in fibres:
+            if f in self.results:
+                continue
+            self.current = f
+            n0 = self.tests
+            placed = False
+            for h in list(self.hyp):
+                g = self.apply(h, f)
+                if not g or g in self.used_far:
+                    continue
+                hit = await self._hit(f, g, test, control, tries=2)
+                if hit is None:
+                    return False
+                if hit:
+                    counts[f] = counts.get(f, 0) + self.tests - n0
+                    self.record(f, Result("cross", g, counts[f], f"same pattern: {h.label}"))
+                    if await self._swap_check(f, g, test, control, targets, counts) is None:
+                        return False
+                    placed = True
+                    break
+            if placed:
+                continue
+            self.say(f"  {fname(f)} does not follow the pattern; searching for it on its own")
+            res = await self.run_one(f, test, self.opts, control)
+            if res is None:
+                return False
+            res.tests += counts.get(f, 0) + self.tests - n0
+            self.record(f, res)
+            if res.state == "cross":
+                if await self._swap_check(f, res.found, test, control, targets, counts) is None:
+                    return False
+        return True
+
     async def run_ribbon(self, r: int, fibres: list[int], test, control, targets: set[int]) -> bool:
         counts: dict[int, int] = {}
         pending: list[int] = []
+        probed: set[int] = set()
         # 1. straight pass: every fibre on its own position, one retry with a long tone
         for f in fibres:
             if f in self.results:
@@ -291,6 +371,24 @@ class Engine:
             else:
                 pending.append(f)
                 self.say(f"  {fname(f)} {rplabel(f)} dark on its own position, will search after the ribbon")
+            # v26: the first fibres of the ribbon all dark: check for a crossed ribbon or bundle straight away
+            straight_now = sum(1 for x in fibres if self.results.get(x) and self.results[x].state == "straight")
+            if not straight_now and len(pending) == self.EARLY_DARK and not probed:
+                self.say(f"R{r}: the first {self.EARLY_DARK} fibres are all dark on their own positions. "
+                         f"Either the ribbon is crossed with another ribbon or bundle, or it is disconnected.")
+                probed.add(pending[0])
+                found = await self._ribbon_probe(r, pending[0], test, control, counts)
+                if found is None:
+                    return False
+                if found:
+                    g, why = found
+                    f0 = pending[0]
+                    self.record(f0, Result("cross", g, counts[f0], why))
+                    if await self._swap_check(f0, g, test, control, targets, counts) is None:
+                        return False
+                    rest = [x for x in fibres if x not in self.results]
+                    return await self._apply_pattern(r, rest, test, control, targets, counts, why)
+                self.say(f"R{r}: testing the rest of the ribbon on its own positions to see if any fibre gets through.")
         straight = sum(1 for f in fibres if self.results.get(f) and self.results[f].state == "straight")
         # 2. gaps: pending sources against unclaimed far ends in this ribbon
         if pending and straight:
@@ -333,20 +431,33 @@ class Engine:
                     if self.after_dis:
                         await self.after_dis(f)
         elif pending:
-            # 4. nothing in this ribbon is straight: the ribbon itself is crossed, use the full ladder
-            self.say(f"R{r}: no fibre straight, searching neighbouring ribbons and bundles")
-            for f in pending:
+            # 4. nothing in this ribbon is straight: crossed ribbon or bundle, or the whole ribbon is out
+            self.say(f"R{r}: no fibre gets through on its own position.")
+            found = False
+            for f in [x for x in (pending[len(pending) // 2], pending[0], pending[-1]) if x not in probed][:2]:
+                probed.add(f)
+                found = await self._ribbon_probe(r, f, test, control, counts)
+                if found is None:
+                    return False
+                if found:
+                    g, why = found
+                    self.record(f, Result("cross", g, counts[f], why))
+                    if await self._swap_check(f, g, test, control, targets, counts) is None:
+                        return False
+                    return await self._apply_pattern(r, [x for x in pending if x not in self.results],
+                                                     test, control, targets, counts, why)
+            where = ", ".join(f"R{x}" for x in (r - 1, r + 1, r + PERBUNDLE, r - PERBUNDLE) if 1 <= x <= RIBBONS)
+            self.say(f"R{r}: no light on any fibre, and none of them turn up in R{r} reversed or in {where}. "
+                     f"The ribbon looks disconnected or unpatched, not crossed. "
+                     f"Next step on site: check the patching at both ODFs and the ribbon splices. "
+                     f"If other ribbons are also all dark, check the tone RTU and FMS first.")
+            self.dark_ribbons.append(r)
+            for i, f in enumerate(pending):
                 if f in self.results:
                     continue
-                res = await self.run_one(f, test, self.opts, control, skip_expected=True)
-                if res is None:
-                    return False
-                res.tests += counts.get(f, 0)
-                self.record(f, res)
-                if res.state == "cross":
-                    sw = await self._swap_check(f, res.found, test, control, targets, counts)
-                    if sw is None:
-                        return False
+                self.record(f, Result("dis", 0, counts.get(f, 0), f"whole R{r} dark; not crossed with a neighbouring ribbon or bundle"))
+                if self.after_dis and i < 2:
+                    await self.after_dis(f)
         return True
 
     async def run(self, targets: list[int], test, control) -> bool:
@@ -358,6 +469,9 @@ class Engine:
         for r in sorted(ribbons):
             if not await self.run_ribbon(r, ribbons[r], test, control, tset):
                 return False
+            if len(self.dark_ribbons) >= 2 and self.dark_ribbons[-1] == r and self.dark_ribbons[-2] == r - 1:
+                self.say(f"Warning: R{r - 1} and R{r} are both completely dark. That usually means the tone is not "
+                         f"reaching the cable at all: check the tone RTU, its patch to the ODF, and FMS.")
         # 5. second pass for fibres the ladder could not place (crossed ribbons only)
         left = [f for f in targets if self.results.get(f) and self.results[f].state == "unres"]
         if left:
