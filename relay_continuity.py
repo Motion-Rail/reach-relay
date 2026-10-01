@@ -309,11 +309,12 @@ def make_router(valid_token, check_key, tone, live_tone: bool) -> APIRouter:
                                               duration=dur, range_m=80000, comment=comment)
             except StartRefused as e:
                 return {"verdict": "start_refused", "detail": str(e), "seconds": round(time.time() - t0, 1)}
+            via = "adhoc" if wid in getattr(fms, "_adhoc", {}) else "workflow"
             out = await asyncio.to_thread(fms.wait, wid, posted=posted)
         return {"verdict": out.verdict, "detail": out.detail[:600], "seconds": round(out.seconds, 1),
                 "acqStart": (out.raw or {}).get("acqStart"), "timeline": (out.raw or {}).get("timeline", []),
                 "posted": posted, "lenM": _num((out.raw or {}).get("linkLength")),
-                "workflowId": wid}
+                "workflowId": wid, "via": via}
 
     # ---------------- single calls ----------------
     @router.post("/api/continuity/pace")
@@ -548,7 +549,7 @@ def make_router(valid_token, check_key, tone, live_tone: bool) -> APIRouter:
                 job["testLog"].append({"t": round(t0, 1), "src": src, "cand": cand, "verdict": v,
                                        "otdrS": res.get("seconds"), "cycleS": round(time.time() - t0, 1),
                                        "toneS": tone_s, "leadS": lead_s, "workflow": res.get("workflowId", ""),
-                                       "lenM": res.get("lenM"),
+                                       "lenM": res.get("lenM"), "via": res.get("via"),
                                        "acqAfterToneS": (round(res["acqStart"] - tone_state.get("start", t0), 1)
                                                          if res.get("acqStart") else None),
                                        "timeline": res.get("timeline", [])[:8] if len(job["testLog"]) < 60 else [],

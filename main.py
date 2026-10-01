@@ -26,6 +26,7 @@ import httpx
 from fastapi import FastAPI, HTTPException, Header
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
+import fms_continuity as fc
 
 # ── EXFO auth ────────────────────────────────────────────────────────────────
 AUTH_BASE     = os.getenv("EXFO_AUTH_BASE",  "https://raman.ems.exfo-fms.com")
@@ -50,7 +51,7 @@ MEAS_PAYLOAD_TEMPLATE = os.getenv(
 SETUP_NAME  = os.getenv("SETUP_NAME", "")
 PAGE_SIZE   = int(os.getenv("PAGE_SIZE", "50"))
 
-RELAY_VERSION = "v23"
+RELAY_VERSION = "v24"
 
 # ── relay access ─────────────────────────────────────────────────────────────
 APP_KEY    = os.getenv("APP_KEY", "")
@@ -256,7 +257,7 @@ async def health():
         fms = {k: FMS_STATUS[k] for k in ("ok", "since", "detail")}
     except Exception:                                   # noqa: BLE001
         fms = {"ok": True, "since": 0, "detail": ""}
-    return {"ok": True, "version": RELAY_VERSION, "fms": fms, "origins": ALLOWED_ORIGINS, "auth_host": AUTH_BASE, "topo_host": TOPO_HOST,
+    return {"ok": True, "version": RELAY_VERSION, "otdrMode": fc.OTDR_MODE, "fms": fms, "origins": ALLOWED_ORIGINS, "auth_host": AUTH_BASE, "topo_host": TOPO_HOST,
             "graphql": GRAPHQL_URL, "tone": "live" if LIVE_TONE else "simulated",
             "tone_id_field": TONE_ID_FIELD, "cached": len(ROUTE_ID_CACHE), "rtus": len(RTU_INDEX), "client": CLIENT_ID}
 

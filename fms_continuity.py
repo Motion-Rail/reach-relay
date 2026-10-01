@@ -22,6 +22,21 @@ What this is built on (captured from the FMS Tasks history, 28 Sep 2026):
 
 Starting: `start_otdr()` posts to the Conductor start call through the FMS gateway
 (POST /workflow/server/api/workflow/<name>). Proven working 28 Sep 2026.
+
+v24 (1 Oct 2026): EXFO asked us to stop creating a Task per OTDR. The default is now the
+ad hoc call the FMS UI uses for "Test On Demand > Start Test" (captured 1 Oct 2026):
+    POST /api/topology/control/remotetestunits/{rtu}/command/opticalroutes/{route}/otdr
+    {"spliceLossThreshold":0.02,"reflectanceThreshold":-72,"endOfFiberThreshold":4,
+     "wavelength":"0.00000155","duration":N,"autoSettings":true}
+returns a promise id (GUID) and creates no Task. The outcome comes back two ways:
+  * pushed over STOMP (SockJS websocket /api/topology/ws/connection, access_token query),
+    topic /topic/monitoredassets/{route}/testsetups/adhoc/message/{promise}, body
+    {promiseId, isError, body, lastTestResultId, testTime, ...}. A live fibre refusal is
+    pushed with isError and the "Live fiber detected." text; it is not stored as a result.
+  * a stored result in /api/measure/v1/results (metadata.PromiseId = promise,
+    brief.LinkResults.Length in metres, metadata.TestTime UTC).
+The relay listens on the websocket and also polls the results, whichever answers first.
+OTDR_MODE=workflow switches back to the old Conductor path.
 """
 from __future__ import annotations
 
@@ -41,6 +56,11 @@ WF_BASE = HOST + "/workflow/server/api"
 WF_NAME = "postBulkTests_On_Multiple_RTUs_ORs_Dynamic"
 SUB_WF_NAME = "postAdhocTest_On_Input_OR"
 CLIENT_ID = "fg-topologyui"
+OTDR_MODE = os.environ.get("OTDR_MODE", "adhoc").strip().lower()
+ADHOC_URL = HOST + "/api/topology/control/remotetestunits/{rtu}/command/opticalroutes/{route}/otdr"
+RESULTS_URL = HOST + "/api/measure/v1/results/"
+WS_URL = re.sub(r"^http", "ws", HOST) + "/api/topology/ws/connection"
+ADHOC_TOPIC = "/topic/monitoredassets/{route}/testsetups/adhoc/message/{promise}"
 
 # The RTU's own refusal when light is already on the fibre. Proven on RGAC2/SNBC
 # 28 Sep 2026 (continuity_poc_20260928_174646.json): the sub workflow returns
@@ -168,6 +188,13 @@ class Fms:
     def start_otdr(self, rtu_id: int, route_id: int, route_name: str, *,
                    duration: int = 5, range_m: int = 80000, comment: str = "continuity",
                    dry_run: bool = False) -> str | dict:
+        if OTDR_MODE != "workflow":
+            pid = self._start_adhoc(rtu_id, route_id, duration=duration, dry_run=dry_run)
+            if pid is not None:
+                return pid
+            # No push channel: a live fibre refusal would never be seen, so use the old
+            # workflow call for this one test rather than risk a false reading.
+            self.ws_fallbacks = getattr(self, "ws_fallbacks", 0) + 1
         wf_input = build_otdr_input(rtu_id, route_id, route_name, duration=duration,
                                     range_m=range_m, comment=comment, user=self.user_fields())
         if dry_run:
@@ -226,7 +253,109 @@ class Fms:
         except Exception:                                   # noqa: BLE001
             return None, []
 
+    # ---- v24: ad hoc OTDR (no Task) ----
+    def _start_adhoc(self, rtu_id, route_id, *, duration: int, dry_run: bool = False):
+        body = adhoc_payload(duration)
+        url = ADHOC_URL.format(rtu=int(rtu_id), route=int(route_id))
+        if dry_run:
+            return {"url": url, "body": body}
+        watch = StompWatch.open(self)            # listen before posting so a fast refusal is not missed
+        if watch is None and OTDR_MODE != "adhoc-poll":
+            return None
+        try:
+            r = self.post(url, json=body)
+        except Exception:
+            if watch:
+                watch.close()
+            raise
+        if r.status_code == 409 or "AlreadyScheduled" in r.text:
+            if watch:
+                watch.close()
+            raise StartRefused("409 test already scheduled on this RTU: " + r.text[:200])
+        if not r.ok:
+            if watch:
+                watch.close()
+            raise StartRefused(f"{r.status_code} {r.text[:300]}")
+        pid = r.text.strip().strip('"')
+        if not re.fullmatch(r"[0-9a-fA-F-]{36}", pid):
+            if watch:
+                watch.close()
+            raise StartRefused("unexpected start reply: " + r.text[:200])
+        if watch:
+            watch.subscribe(ADHOC_TOPIC.format(route=int(route_id), promise=pid))
+        if not hasattr(self, "_adhoc"):
+            self._adhoc = {}
+        self._adhoc[pid] = {"route": int(route_id), "watch": watch, "duration": int(duration)}
+        return pid
+
+    def adhoc_results(self, route_id: int, top: int = 5) -> list[dict]:
+        params = {"$filter": f"metadata/AssetId eq {int(route_id)} and metadata/TestCategory eq 'Adhoc' "
+                             f"and metadata/TestType eq 'OTDR'",
+                  "$orderby": "metadata/TestTime desc", "$top": str(top), "$skip": "0",
+                  "$select": "resultid,brief/LinkResults,metadata"}
+        r = self.get(RESULTS_URL, params=params)
+        r.raise_for_status()
+        j = r.json()
+        return j.get("results", j if isinstance(j, list) else [])
+
+    def _adhoc_from_result(self, res: dict, secs: float, pid: str) -> "Outcome":
+        md = res.get("metadata") or {}
+        link = ((res.get("brief") or {}).get("LinkResults") or {})
+        if md.get("HasError"):
+            reason = " | ".join(_strings(res, keys=("message", "error", "errorMessage", "ErrorMessage",
+                                                     "reason", "detail", "messageKey", "Error"))) or "error result"
+            return Outcome("clash" if LIVE_PATTERNS.search(reason) else "failed", reason[:1500], secs, pid, raw=md)
+        acq = _utc_epoch(md.get("TestTime"))
+        return Outcome("clean", "OTDR completed " + str(link.get("Length", "")) + " m", secs, pid,
+                       raw={"linkLength": link.get("Length"), "completion": link.get("CompletionStatus"),
+                            "resultId": md.get("ResultId"), "testTime": md.get("TestTime"), "acqStart": acq,
+                            "timeline": [{"ref": "fms testTime", "type": "adhoc", "startS": None, "durS": None}]})
+
+    def _wait_adhoc(self, pid: str, limit: float, poll_s: float = 3.0) -> "Outcome":
+        info = self._adhoc.pop(pid)
+        route, watch = info["route"], info["watch"]
+        t0, next_poll = time.time(), time.time() + 2.0
+        try:
+            while True:
+                if watch:
+                    msg = watch.next_message(timeout=1.0)
+                    if msg is not None and str(msg.get("promiseId") or msg.get("messageId")) == pid:
+                        secs = time.time() - t0
+                        if msg.get("isError") or msg.get("error"):
+                            reason = json.dumps(msg.get("body")) if not isinstance(msg.get("body"), str) else msg["body"]
+                            reason = (reason or "") + " " + " ".join(_strings(msg, keys=("message", "messageKey",
+                                                                                          "error", "errorMessage")))
+                            reason = reason.strip() or "ad hoc OTDR error"
+                            return Outcome("clash" if LIVE_PATTERNS.search(reason) else "failed",
+                                           reason[:1500], secs, pid, raw=msg)
+                        # completed: read the stored result for the length
+                        for _ in range(8):
+                            for res in self.adhoc_results(route):
+                                if (res.get("metadata") or {}).get("PromiseId") == pid:
+                                    return self._adhoc_from_result(res, time.time() - t0, pid)
+                            time.sleep(1.0)
+                        return Outcome("clean", "OTDR completed (length not read)", secs, pid,
+                                       raw={"acqStart": _utc_epoch(msg.get("testTime")), "timeline": []})
+                else:
+                    time.sleep(1.0)
+                if time.time() >= next_poll:
+                    next_poll = time.time() + poll_s
+                    try:
+                        for res in self.adhoc_results(route):
+                            if (res.get("metadata") or {}).get("PromiseId") == pid:
+                                return self._adhoc_from_result(res, time.time() - t0, pid)
+                    except requests.RequestException:
+                        pass
+                if time.time() - t0 > limit:
+                    return Outcome("timeout", "no ad hoc result after " + str(round(limit)) + " s"
+                                   + ("" if watch else " (no websocket)"), time.time() - t0, pid)
+        finally:
+            if watch:
+                watch.close()
+
     def wait(self, wid: str, poll: float = 1.0, limit: float = 90, posted: float | None = None) -> "Outcome":
+        if wid in getattr(self, "_adhoc", {}):
+            return self._wait_adhoc(wid, limit=limit)
         t0 = time.time()
         while True:
             wf = self.workflow(wid)
@@ -282,6 +411,113 @@ class Outcome:
     seconds: float
     workflow_id: str = ""
     raw: dict = field(default_factory=dict)
+
+
+def adhoc_payload(duration: int) -> dict:
+    """Exactly what the FMS UI sends for Test On Demand (1 Oct 2026), with our duration."""
+    return {"spliceLossThreshold": 0.02, "reflectanceThreshold": -72, "endOfFiberThreshold": 4,
+            "wavelength": "0.00000155", "duration": int(duration), "autoSettings": True}
+
+
+def _utc_epoch(ts) -> float | None:
+    """FMS TestTime, e.g. 2026-10-01T14:21:57.3693100Z (UTC, 7 decimal places)."""
+    if not ts:
+        return None
+    try:
+        from datetime import datetime, timezone
+        m = re.match(r"(\d{4}-\d\d-\d\dT\d\d:\d\d:\d\d)(\.\d+)?", str(ts))
+        base = datetime.strptime(m.group(1), "%Y-%m-%dT%H:%M:%S").replace(tzinfo=timezone.utc).timestamp()
+        return base + (float(m.group(2)) if m.group(2) else 0.0)
+    except Exception:
+        return None
+
+
+class StompWatch:
+    """Minimal STOMP 1.2 over a SockJS websocket, the way the FMS UI listens for ad hoc
+    results. Best effort: if it cannot connect, the caller falls back to polling results."""
+
+    def __init__(self, ws):
+        self.ws, self.buf, self.n = ws, [], 0
+
+    @classmethod
+    def open(cls, fms: "Fms") -> "StompWatch | None":
+        if os.environ.get("ADHOC_WS", "1") == "0":
+            return None
+        try:
+            import random
+            import string
+            from urllib.parse import quote
+            from websockets.sync.client import connect
+            tok = fms._auth()["Authorization"].split(" ", 1)[1]
+            sess = "".join(random.choice(string.ascii_lowercase + string.digits) for _ in range(8))
+            url = f"{WS_URL}/{random.randint(0, 999):03d}/{sess}/websocket?access_token={quote(tok)}"
+            ws = connect(url, open_timeout=10, close_timeout=2, max_size=2 ** 22)
+            self = cls(ws)
+            if ws.recv(timeout=10) != "o":
+                raise RuntimeError("no SockJS open frame")
+            self._send("CONNECT\naccept-version:1.2,1.1,1.0\nheart-beat:0,0\n\n\x00")
+            deadline = time.time() + 10
+            while time.time() < deadline:
+                for f in self._frames(timeout=deadline - time.time()):
+                    if f.startswith("CONNECTED"):
+                        return self
+                    if f.startswith("ERROR"):
+                        raise RuntimeError(f[:200])
+            raise RuntimeError("STOMP not connected")
+        except Exception:                                     # noqa: BLE001
+            try:
+                ws.close()                                    # type: ignore[name-defined]
+            except Exception:
+                pass
+            return None
+
+    def _send(self, frame: str):
+        self.ws.send(json.dumps([frame]))
+
+    def _frames(self, timeout: float) -> list[str]:
+        try:
+            raw = self.ws.recv(timeout=max(0.05, timeout))
+        except TimeoutError:
+            return []
+        if raw.startswith("a"):
+            try:
+                return [str(x) for x in json.loads(raw[1:])]
+            except Exception:
+                return []
+        if raw.startswith("c"):
+            raise ConnectionError("SockJS closed " + raw[:120])
+        return []                                             # "h" heartbeat, "o" open
+
+    def subscribe(self, dest: str):
+        self.n += 1
+        self._send(f"SUBSCRIBE\nid:sub-{self.n}\ndestination:{dest}\nack:auto\n\n\x00")
+
+    def next_message(self, timeout: float = 1.0) -> dict | None:
+        """The next MESSAGE body as a dict, or None if nothing arrived in time."""
+        if not self.buf:
+            try:
+                self.buf += [f for f in self._frames(timeout) if f.startswith("MESSAGE")]
+            except Exception:                                 # noqa: BLE001
+                return None
+        while self.buf:
+            f = self.buf.pop(0)
+            body = f.split("\n\n", 1)[1] if "\n\n" in f else ""
+            body = body.rstrip("\x00")
+            try:
+                return json.loads(body)
+            except Exception:
+                continue
+        return None
+
+    def close(self):
+        try:
+            self._send("DISCONNECT\n\n\x00")
+        except Exception:
+            pass
+        try:
+            self.ws.close()
+        except Exception:
+            pass
 
 
 def build_otdr_input(rtu_id, route_id, route_name, *, duration, range_m, comment, user) -> dict:
