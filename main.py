@@ -51,7 +51,7 @@ MEAS_PAYLOAD_TEMPLATE = os.getenv(
 SETUP_NAME  = os.getenv("SETUP_NAME", "")
 PAGE_SIZE   = int(os.getenv("PAGE_SIZE", "50"))
 
-RELAY_VERSION = "v24"
+RELAY_VERSION = "v25"
 
 # ── relay access ─────────────────────────────────────────────────────────────
 APP_KEY    = os.getenv("APP_KEY", "")
@@ -59,8 +59,12 @@ APP_ORIGIN = os.getenv("APP_ORIGIN", "*")
 # v13: the app moved to motionrail.onrender.com. APP_ORIGIN (env) may hold one or more
 # comma-separated origins; APP_ORIGINS_EXTRA adds more without touching APP_ORIGIN.
 APP_ORIGINS_EXTRA = os.getenv("APP_ORIGINS_EXTRA", "https://motionrail.onrender.com")
+# v25: the old tone-tester.onrender.com site no longer exists, so it is never allowed even if
+# APP_ORIGIN still lists it.
+RETIRED_ORIGINS = {"https://tone-tester.onrender.com"}
 ALLOWED_ORIGINS = (["*"] if APP_ORIGIN.strip() == "*" else
-                   sorted({o.strip().rstrip("/") for o in (APP_ORIGIN + "," + APP_ORIGINS_EXTRA).split(",") if o.strip()}))
+                   sorted({o.strip().rstrip("/") for o in (APP_ORIGIN + "," + APP_ORIGINS_EXTRA).split(",")
+                           if o.strip() and o.strip().rstrip("/") not in RETIRED_ORIGINS}))
 TOKEN_TTL_FALLBACK = int(os.getenv("TOKEN_TTL_FALLBACK", "900"))
 
 app = FastAPI(title="Fibre Tone Tester relay")
@@ -377,3 +381,7 @@ async def _continuity_tone(sid, fibre, rtu_id, wl, dur, hz, route_id=None):
                       x_app_key=APP_KEY or None, x_session=sid)
 
 app.include_router(_continuity_router(_valid_token, _check_key, _continuity_tone, LIVE_TONE))
+
+# ── v25: who is online + run history (see relay_team.py) ─────────────────────────
+from relay_team import make_router as _team_router
+app.include_router(_team_router(_valid_token, _check_key, SESSIONS, RTU_INDEX, RELAY_VERSION))
