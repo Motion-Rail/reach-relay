@@ -51,7 +51,7 @@ MEAS_PAYLOAD_TEMPLATE = os.getenv(
 SETUP_NAME  = os.getenv("SETUP_NAME", "")
 PAGE_SIZE   = int(os.getenv("PAGE_SIZE", "50"))
 
-RELAY_VERSION = "v31"
+RELAY_VERSION = "v32"
 
 # ── relay access ─────────────────────────────────────────────────────────────
 APP_KEY    = os.getenv("APP_KEY", "")
@@ -443,3 +443,7 @@ app.include_router(_push_router(_valid_token, _check_key, SESSIONS))
 # ── v31: Fibres screen, every fibre of a cable with its latest results (see relay_fibres.py) ──
 from relay_fibres import make_router as _fibres_router
 app.include_router(_fibres_router(_valid_token, _check_key, SESSIONS))
+
+# ── v32: live OTDR on one fibre, trace after trace (see relay_otdr.py) ──
+from relay_otdr import make_router as _otdr_router
+app.include_router(_otdr_router(_valid_token, _check_key, SESSIONS))

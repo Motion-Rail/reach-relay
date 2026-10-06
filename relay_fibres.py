@@ -381,7 +381,16 @@ def live_part(stem: str, ends: list[dict], token: str | None) -> dict:
                           "end": _end_of(ends, t.get("rtuId")), "done": t.get("done"), "total": t.get("total"),
                           "testing": [f for f, s in fib if s in ("IN_PROGRESS", "SCHEDULED")],
                           "finished": [f for f, s in fib if s in ("COMPLETED", "FAILED")]})
-    return {"t": now, "runs": runs, "uni": uni, "tasks": tasks}
+    otdr = []
+    try:                                                # v32: live OTDR sessions on this cable
+        from relay_otdr import SESSIONS_L
+        for o in list(SESSIONS_L.values()):
+            if o["state"] == "running" and o["stem"] == stem:
+                otdr.append({"id": o["id"], "owner": o["owner"], "fibre": o["fibre"], "rtuId": o["rtuId"],
+                             "end": _end_of(ends, o["rtuId"]), "count": o["count"]})
+    except Exception:                                   # noqa: BLE001
+        pass
+    return {"t": now, "runs": runs, "uni": uni, "tasks": tasks, "otdr": otdr}
 
 
 class FibresIn(BaseModel):
