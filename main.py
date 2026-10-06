@@ -51,7 +51,7 @@ MEAS_PAYLOAD_TEMPLATE = os.getenv(
 SETUP_NAME  = os.getenv("SETUP_NAME", "")
 PAGE_SIZE   = int(os.getenv("PAGE_SIZE", "50"))
 
-RELAY_VERSION = "v25"
+RELAY_VERSION = "v26"
 
 # ── relay access ─────────────────────────────────────────────────────────────
 APP_KEY    = os.getenv("APP_KEY", "")
@@ -385,3 +385,7 @@ app.include_router(_continuity_router(_valid_token, _check_key, _continuity_tone
 # ── v25: who is online + run history (see relay_team.py) ─────────────────────────
 from relay_team import make_router as _team_router
 app.include_router(_team_router(_valid_token, _check_key, SESSIONS, RTU_INDEX, RELAY_VERSION))
+
+# ── v26: RTU Tasks, cancel, bulk start with full settings (see relay_bulk.py) ──────
+from relay_bulk import make_router as _bulk_router
+app.include_router(_bulk_router(_valid_token, _check_key, SESSIONS, RELAY_VERSION))
