@@ -229,7 +229,7 @@ def make_router(valid_token, check_key, sessions: dict, rtu_index: dict, relay_v
                   str(first.get("TestConfigName") or "")
         return {"source": "fms", "id": wf.get("workflowId", ""), "type": "FMS " + kind,
                 "owner": _owner(inp.get("creatorName") or inp.get("UserName") or ""),
-                "rtu": rtu_name(fms, first.get("RtuId")),
+                "rtu": rtu_name(fms, first.get("RtuId")), "rtuId": str(first.get("RtuId") or ""),
                 "cable": re.sub(r"-R\d+$", "", _cable(names[0])) if names else "",
                 "scope": scope, "result": result,
                 "summary": (f"{n} fibres, still running" if status == "RUNNING" else

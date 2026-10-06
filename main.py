@@ -51,7 +51,7 @@ MEAS_PAYLOAD_TEMPLATE = os.getenv(
 SETUP_NAME  = os.getenv("SETUP_NAME", "")
 PAGE_SIZE   = int(os.getenv("PAGE_SIZE", "50"))
 
-RELAY_VERSION = "v29"
+RELAY_VERSION = "v30"
 
 # ── relay access ─────────────────────────────────────────────────────────────
 APP_KEY    = os.getenv("APP_KEY", "")
@@ -435,3 +435,7 @@ app.include_router(_team_router(_valid_token, _check_key, SESSIONS, RTU_INDEX, R
 # ── v26: RTU Tasks, cancel, bulk start with full settings (see relay_bulk.py) ──────
 from relay_bulk import make_router as _bulk_router
 app.include_router(_bulk_router(_valid_token, _check_key, SESSIONS, RELAY_VERSION))
+
+# ── v30: phone and browser notifications (see relay_push.py) ─────────────────────
+from relay_push import make_router as _push_router
+app.include_router(_push_router(_valid_token, _check_key, SESSIONS))

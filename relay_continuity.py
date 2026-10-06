@@ -64,7 +64,7 @@ PACE = {                              # measured on RGAC2 -> SNBC, 28 Sep 2026
     "outage_wait_s": 60,              # v22: FMS not answering: wait, then retry the same test
     "outage_limit_s": 7200,           #      give up (run fails, resumable) after 2 h                # v20: acquisition must start at least this long before the tone ends              # v18: a dark result later than tone start + tone + this is rechecked
 }
-RELAY_VERSION = "v29"   # kept in step with main.py
+RELAY_VERSION = "v30"   # kept in step with main.py
 JOBS: dict[str, dict] = {}
 LOCKS: dict[str, asyncio.Lock] = {}
 ROUTES: dict[str, dict[str, dict]] = {}          # rtuName -> {routeName: node}
@@ -729,7 +729,16 @@ def make_router(valid_token, check_key, tone, live_tone: bool) -> APIRouter:
         return title, lines[:20]
 
     async def notify(job: dict):
-        if not TEAMS_WEBHOOK or job.get("simulate") or job["state"] not in ("done", "stopped", "error"):
+        if job["state"] not in ("done", "stopped", "error"):
+            return
+        try:                                            # v30: a phone or browser notification to whoever started it
+            from relay_push import push_user
+            title, lines = summary_lines(job)
+            job["pushed"] = await push_user(job.get("user", ""), title, lines[0] if lines else "",
+                                            tag="run-" + job["id"], kind="e2e")
+        except Exception as e:                          # noqa: BLE001
+            job["pushed"] = "error: " + str(e)[:120]
+        if not TEAMS_WEBHOOK or job.get("simulate"):
             return
         try:
             title, lines = summary_lines(job)

@@ -87,6 +87,11 @@ def desktop_allowed(sessions: dict, x_session) -> bool:
 
 
 # v28: an RTU is marked as toning while a Uni-dir tone runs, so the desktop light shows it as testing.
+# v30: set by make_router so the push watcher (relay_push.py) can read FMS Tasks
+READ_TASKS = None
+FMS_FOR = None
+TASK_DETAIL = None
+
 TONING: dict[str, dict] = {}          # rtuId -> {"until": epoch, "user": name, "fibre": str}
 
 
@@ -345,6 +350,9 @@ def make_router(valid_token, check_key, sessions: dict, relay_version: str) -> A
                     finished.append({"id": s.get("workflowId"), "status": s.get("status"),
                                      "started": s.get("startTime"), "ended": s.get("endTime")})
         return {"running": running, "byRtu": by_rtu, "finished": finished}
+
+    global READ_TASKS, FMS_FOR, TASK_DETAIL
+    READ_TASKS, FMS_FOR, TASK_DETAIL = read_tasks, fms_for, task_detail
 
     @router.post("/api/live")
     async def live(x_app_key: str | None = Header(default=None), x_session: str | None = Header(default=None)):
