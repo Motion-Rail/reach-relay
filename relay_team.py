@@ -187,7 +187,9 @@ def make_router(valid_token, check_key, sessions: dict, rtu_index: dict, relay_v
         status = str(wf.get("status") or "")
         if status == "RUNNING":
             result = "Running"
-        elif status in ("FAILED", "TERMINATED", "TIMED_OUT") and not ok:
+        elif status == "TERMINATED":                # v27: cancelled (FMS's Tasks page hides these)
+            result = "Cancelled"
+        elif status in ("FAILED", "TIMED_OUT") and not ok:
             result = "Failed"
         elif failed:
             result = "Issues"
@@ -212,6 +214,7 @@ def make_router(valid_token, check_key, sessions: dict, rtu_index: dict, relay_v
                 "cable": re.sub(r"-R\d+$", "", _cable(names[0])) if names else "",
                 "scope": scope, "result": result,
                 "summary": (f"{n} fibres, still running" if status == "RUNNING" else
+                            f"Cancelled after {ok} of {n}" if status == "TERMINATED" else
                             f"{ok} of {n} completed" + (f", {failed} failed" if failed else ""))
                            + (f". {setting}" if setting else "") + (f". {inp.get('comment')}" if inp.get("comment") else ""),
                 "started": (wf.get("startTime") or 0) / 1000, "ended": (wf.get("endTime") or 0) / 1000 or None,

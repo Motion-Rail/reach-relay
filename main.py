@@ -51,7 +51,7 @@ MEAS_PAYLOAD_TEMPLATE = os.getenv(
 SETUP_NAME  = os.getenv("SETUP_NAME", "")
 PAGE_SIZE   = int(os.getenv("PAGE_SIZE", "50"))
 
-RELAY_VERSION = "v26"
+RELAY_VERSION = "v27"
 
 # ── relay access ─────────────────────────────────────────────────────────────
 APP_KEY    = os.getenv("APP_KEY", "")
@@ -242,6 +242,9 @@ class PrimeIn(BaseModel):
     search: str
     rtuId: str | None = None
 
+class RtusIn(BaseModel):
+    names: list[str]
+
 class ToneIn(BaseModel):
     fibre: str
     stem: str | None = None
@@ -305,6 +308,44 @@ async def routes(body: PrimeIn, x_app_key: str | None = Header(default=None),
 
     out = sorted(groups.values(), key=lambda g: (not g["online"], g["stem"], g["site"], g["rtuName"]))
     return {"ok": True, "totalCount": total, "cables": out}
+
+
+# ── v27: RTU online state for the desktop list ────────────────────────────────
+_RTU_STATE: dict[str, dict] = {}          # RTU name -> {"t": ts, ...state}
+
+@app.post("/api/rtus")
+async def rtus(body: RtusIn, x_app_key: str | None = Header(default=None),
+               x_session: str | None = Header(default=None)):
+    """Attach state per RTU name, from ONE route of that RTU (first=1), cached 60 s.
+    online is true when FMS reports the RTU attached (same rule as the mobile cable list)."""
+    _check_key(x_app_key)
+    token = await _valid_token(x_session)
+    from relay_bulk import require_desktop
+    require_desktop(SESSIONS, x_session)
+    names = [n.strip() for n in body.names if n and n.strip()][:20]
+
+    async def one(name):
+        hit = _RTU_STATE.get(name)
+        if hit and time.time() - hit["t"] < 60:
+            return name, hit
+        try:
+            _, nodes = await _graphql_search(token, name, 5, 0)
+            node = next((n for n in nodes if str(n.get("rtuName", "")) == name), None)
+            if node is None:
+                st = {"found": False, "online": False, "attachStatus": "", "site": "", "model": ""}
+            else:
+                meta = _node_rtu_meta(node)
+                st = {"found": True, "online": meta["online"], "attachStatus": meta["attachStatus"],
+                      "site": _node_site(node), "model": meta["model"], "rtuId": str(node.get("rtuId", "")),
+                      "stem": _stem(str(node.get("name", "")))}
+        except HTTPException as e:
+            st = {"found": False, "online": False, "attachStatus": "", "error": str(e.detail)[:120]}
+        st["t"] = time.time()
+        _RTU_STATE[name] = st
+        return name, st
+
+    res = await asyncio.gather(*(one(n) for n in names))
+    return {"ok": True, "rtus": {n: {k: v for k, v in st.items() if k != "t"} for n, st in res}}
 
 
 @app.post("/api/prime")

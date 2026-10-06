@@ -40,6 +40,22 @@ from relay_continuity import LOG_REPO, LOG_TOKEN, _push_log_sync
 from relay_team import SEARCH, USER_NAMES, _claims, _owner, _wf_input
 
 CANCEL_POLICY = os.getenv("CANCEL_POLICY", "confirm").strip().lower()
+# v27: the desktop console (Tasks, cancel, bulk start, RTU states) is limited to these sign ins.
+# Comma separated emails; "*" = everyone. The mobile app is not affected.
+DESKTOP_USERS = {u.strip().lower() for u in os.getenv("DESKTOP_USERS", "alkis.kardasopoulos@motionrail.co.uk").split(",")
+                 if u.strip()}
+
+
+def desktop_allowed(sessions: dict, x_session) -> bool:
+    if "*" in DESKTOP_USERS:
+        return True
+    user = str((sessions.get(x_session or "") or {}).get("user", "")).strip().lower()
+    return bool(user) and user in DESKTOP_USERS
+
+
+def require_desktop(sessions: dict, x_session):
+    if not desktop_allowed(sessions, x_session):
+        raise HTTPException(403, "Desktop console not enabled for your account")
 WAVELENGTHS = {1310: "0.00000131", 1550: "0.00000155", 1625: "0.000001625"}
 PULSES_NS = [5, 10, 30, 50, 100, 275, 500, 1000, 2500, 5000, 10000, 20000]   # the FMS OTDR dialog list
 IOLM_MODES = {"standard": "Standard iOLM", "fast": "FastOvwNode",
@@ -276,6 +292,7 @@ def make_router(valid_token, check_key, sessions: dict, relay_version: str) -> A
                     x_session: str | None = Header(default=None)):
         check_key(x_app_key)
         token = await valid_token(x_session)
+        require_desktop(sessions, x_session)
         data = await asyncio.to_thread(read_tasks, token, max(0, min(int(body.recent or 0), 30)))
         if body.rtu:
             rid = next((r.get("rtuId") for r in _ROUTES.get(body.rtu, {}).get("routes", [])[:1]), None)
@@ -292,6 +309,7 @@ def make_router(valid_token, check_key, sessions: dict, relay_version: str) -> A
                      x_session: str | None = Header(default=None)):
         check_key(x_app_key)
         token = await valid_token(x_session)
+        require_desktop(sessions, x_session)
         who = me(x_session)
         if not re.fullmatch(r"[0-9a-fA-F-]{36}", body.id or ""):
             raise HTTPException(400, "Not a Task id")
@@ -366,6 +384,7 @@ def make_router(valid_token, check_key, sessions: dict, relay_version: str) -> A
                         x_session: str | None = Header(default=None)):
         check_key(x_app_key)
         token = await valid_token(x_session)
+        require_desktop(sessions, x_session)
         p = await asyncio.to_thread(plan, token, body, user_fields(x_session))
         for i in p["inputs"]:
             i["UserRoles"] = "[roles from your sign in]"
@@ -376,6 +395,7 @@ def make_router(valid_token, check_key, sessions: dict, relay_version: str) -> A
                          x_session: str | None = Header(default=None)):
         check_key(x_app_key)
         token = await valid_token(x_session)
+        require_desktop(sessions, x_session)
 
         def run():
             p = plan(token, body, user_fields(x_session))
@@ -393,6 +413,14 @@ def make_router(valid_token, check_key, sessions: dict, relay_version: str) -> A
         res = await asyncio.to_thread(run)
         _TASKS["t"] = 0
         return {"ok": True, **res}
+
+    @router.post("/api/desktop/access")
+    async def desktop_access(x_app_key: str | None = Header(default=None),
+                             x_session: str | None = Header(default=None)):
+        check_key(x_app_key)
+        if not sessions.get(x_session or ""):
+            raise HTTPException(401, "No session — sign in again")
+        return {"ok": True, "allowed": desktop_allowed(sessions, x_session), "user": me(x_session)}
 
     @router.get("/api/bulk/options")
     async def options():
