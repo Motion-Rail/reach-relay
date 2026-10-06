@@ -36,6 +36,9 @@ from relay_continuity import JOBS, LOG_REPO, LOG_TOKEN, _gh_get_sync, _gh_list_s
 
 PRESENCE_TTL = 120            # seconds since the last heartbeat before someone drops off
 PRESENCE: dict[str, dict] = {}
+# v29: live Uni-dir progress sent by the phone every few seconds while a tone session is open
+UNI_LIVE: dict[str, dict] = {}            # session id -> latest progress
+UNI_LIVE_TTL = 90
 _FMS_RUNNING = {"t": 0.0, "rows": []}
 _FILE_CACHE: dict[str, dict] = {}     # sha -> parsed row
 _DIR_CACHE: dict[str, dict] = {}      # path -> {"t": ts, "items": [...]}
@@ -52,6 +55,22 @@ class PresenceIn(BaseModel):
     rtu: str = ""
     detail: str = ""
     appVersion: str = ""
+
+
+class UniLiveIn(BaseModel):
+    id: str = ""
+    cable: str = ""
+    rtu: str = ""
+    rtuId: str = ""
+    fibre: int = 0            # 1 to 432, the fibre on screen
+    toning: bool = False
+    confirmed: int = 0
+    dis: int = 0
+    cross: int = 0
+    inScope: int = 432
+    location: str = ""
+    started: float = 0
+    ended: bool = False
 
 
 class HistoryIn(BaseModel):
@@ -289,10 +308,27 @@ def make_router(valid_token, check_key, sessions: dict, rtu_index: dict, relay_v
         return {"ok": True, "now": now, "ttl": PRESENCE_TTL, "people": people,
                 "runs": app_runs(), "fmsTasks": tasks, "relayVersion": relay_version}
 
+    @router.post("/api/uni/live")
+    async def uni_live(body: UniLiveIn, x_app_key: str | None = Header(default=None),
+                       x_session: str | None = Header(default=None)):
+        """v29: the phone reports its Uni-dir session (fibre, counts, toning) for the desktop Live screen."""
+        check_key(x_app_key)
+        sess = sessions.get(x_session or "")
+        if not sess:
+            raise HTTPException(401, "No session — sign in again")
+        if body.ended:
+            UNI_LIVE.pop(x_session, None)
+            return {"ok": True}
+        UNI_LIVE[x_session] = {**body.model_dump(), "user": sess.get("user", ""), "name": _display_name(sess),
+                               "cable": re.sub(r"-R\d+$", "", body.cable)[:60], "location": body.location[:80],
+                               "seen": time.time()}
+        return {"ok": True}
+
     @router.post("/api/presence/leave")
     async def leave(x_app_key: str | None = Header(default=None), x_session: str | None = Header(default=None)):
         check_key(x_app_key)
         PRESENCE.pop(x_session or "", None)
+        UNI_LIVE.pop(x_session or "", None)
         return {"ok": True}
 
     # ── history ──────────────────────────────────────────────────────────────

@@ -37,7 +37,8 @@ from pydantic import BaseModel
 
 import fms_continuity as fc
 from relay_continuity import LOG_REPO, LOG_TOKEN, _push_log_sync
-from relay_team import SEARCH, USER_NAMES, _claims, _owner, _wf_input
+from relay_team import PRESENCE, PRESENCE_TTL, SEARCH, UNI_LIVE, UNI_LIVE_TTL, USER_NAMES, _claims, _owner, _wf_input
+from relay_continuity import JOBS
 
 CANCEL_POLICY = os.getenv("CANCEL_POLICY", "confirm").strip().lower()
 # v27: the desktop console (Tasks, cancel, bulk start, RTU states) is limited to these sign ins.
@@ -344,6 +345,44 @@ def make_router(valid_token, check_key, sessions: dict, relay_version: str) -> A
                     finished.append({"id": s.get("workflowId"), "status": s.get("status"),
                                      "started": s.get("startTime"), "ended": s.get("endTime")})
         return {"running": running, "byRtu": by_rtu, "finished": finished}
+
+    @router.post("/api/live")
+    async def live(x_app_key: str | None = Header(default=None), x_session: str | None = Header(default=None)):
+        """v29: everything happening now, for the desktop Live screen: people, E2E runs with their grid,
+        Uni-dir sessions from phones, FMS bulk Tasks and toning RTUs."""
+        check_key(x_app_key)
+        token = await valid_token(x_session)
+        require_desktop(sessions, x_session)
+        now = time.time()
+        people: dict[str, dict] = {}
+        for k, v in PRESENCE.items():
+            if now - v["seen"] <= PRESENCE_TTL:
+                u = v["user"].lower()
+                if u not in people or v["seen"] > people[u]["seen"]:
+                    people[u] = {"name": _owner(USER_NAMES.get(u, v["name"])), "screen": v["screen"], "rtu": v["rtu"],
+                                 "cable": v["cable"], "detail": v["detail"], "seen": v["seen"],
+                                 "device": "desktop" if str(v.get("app", "")).startswith("desktop") or v["screen"] in ("desktop", "console", "live", "history-desktop") else "phone"}
+        for k in [k for k, v in UNI_LIVE.items() if now - v["seen"] > UNI_LIVE_TTL]:
+            UNI_LIVE.pop(k, None)
+        uni = [{**{k: v[k] for k in ("id", "user", "cable", "rtu", "rtuId", "fibre", "toning", "confirmed", "dis", "cross",
+                                     "inScope", "location", "started", "seen")},
+                "name": _owner(USER_NAMES.get(v["user"].lower(), v["name"]))}
+               for v in {x["user"].lower(): x for x in sorted(UNI_LIVE.values(), key=lambda x: x["seen"])}.values()]   # one per person, latest
+        runs = []
+        for j in JOBS.values():
+            if j.get("state") not in ("running", "paused"):
+                continue
+            eng = j.get("engine")
+            res = getattr(eng, "results", {}) or {}
+            runs.append({"id": j["id"], "state": j["state"], "stem": j.get("stem", ""), "ribbons": j.get("ribbons", []),
+                         "toneRtu": j.get("toneRtu"), "testRtu": j.get("testRtu"), "targets": j.get("targets"),
+                         "done": len(res), "owner": _owner(j.get("user", "")), "started": j.get("started"),
+                         "simulate": bool(j.get("simulate")), "current": getattr(eng, "current", None),
+                         "results": {str(f): r.state for f, r in res.items()}})
+        data = await asyncio.to_thread(read_tasks, token, 0)
+        return {"ok": True, "now": now, "people": sorted(people.values(), key=lambda p: p["name"].lower()),
+                "runs": runs, "uni": uni, "tasks": data.get("running", []), "toning": toning_now(),
+                "me": me(x_session)}
 
     @router.post("/api/tasks")
     async def tasks(body: TasksIn, x_app_key: str | None = Header(default=None),
