@@ -51,7 +51,7 @@ MEAS_PAYLOAD_TEMPLATE = os.getenv(
 SETUP_NAME  = os.getenv("SETUP_NAME", "")
 PAGE_SIZE   = int(os.getenv("PAGE_SIZE", "50"))
 
-RELAY_VERSION = "v27"
+RELAY_VERSION = "v28"
 
 # ── relay access ─────────────────────────────────────────────────────────────
 APP_KEY    = os.getenv("APP_KEY", "")
@@ -362,6 +362,11 @@ async def tone(body: ToneIn, x_app_key: str | None = Header(default=None),
                x_session: str | None = Header(default=None)):
     _check_key(x_app_key)
 
+    try:                                    # v28: desktop light shows the RTU as testing while it tones
+        from relay_bulk import mark_toning
+        mark_toning(body.rtuId, body.durationS, str((SESSIONS.get(x_session or "") or {}).get("user", "")), body.fibre)
+    except Exception:                       # noqa: BLE001
+        pass
     if not LIVE_TONE:
         return {"ok": True, "simulated": True,
                 "detail": f"(simulated) tone {body.fibre} @ {body.wavelengthNm}nm "

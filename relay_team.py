@@ -376,17 +376,35 @@ def make_router(valid_token, check_key, sessions: dict, rtu_index: dict, relay_v
                         rows.append(row)
         return rows, ""
 
+    def _search_time(v) -> float:
+        """Search startTime is ISO text on live FMS, epoch ms on some builds. 0 when unknown."""
+        try:
+            if isinstance(v, (int, float)):
+                return v / 1000 if v > 1e11 else float(v)
+            if isinstance(v, str) and v:
+                if v.isdigit():
+                    return _search_time(int(v))
+                from datetime import datetime
+                return datetime.fromisoformat(v.replace("Z", "+00:00")).timestamp()
+        except Exception:                               # noqa: BLE001
+            pass
+        return 0.0
+
     def fms_rows(token: str, days: int) -> tuple[list[dict], str]:
         rows, cutoff = [], time.time() - days * 86400
         try:
             fms = fms_for(token)
-            r = fms.get(SEARCH.format(size=60, status="RUNNING,COMPLETED,FAILED,TERMINATED,TIMED_OUT"))
+            size = 20 if days <= 1 else 40 if days <= 7 else 60   # v28: smaller search for short periods
+            r = fms.get(SEARCH.format(size=size, status="RUNNING,COMPLETED,FAILED,TERMINATED,TIMED_OUT"))
             r.raise_for_status()
             j = r.json()
             for s in j.get("results", j if isinstance(j, list) else []):
                 wid = s.get("workflowId")
                 if not wid:
                     continue
+                st0 = _search_time(s.get("startTime"))
+                if st0 and st0 < cutoff - 3600:          # v28: sorted newest first, so stop before old detail calls
+                    break
                 row = _WF_CACHE.get(wid)
                 if not row:
                     wf = fms.workflow(wid)

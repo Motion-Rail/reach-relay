@@ -46,11 +46,59 @@ DESKTOP_USERS = {u.strip().lower() for u in os.getenv("DESKTOP_USERS", "alkis.ka
                  if u.strip()}
 
 
+# v28: extra desktop users can be added without a restart. The relay reads config/desktop-users.json
+# from the run log repo (LOG_REPO) at most once a minute, in the background: {"users": ["name@motionrail.co.uk"]}.
+# Edit that file in GitHub; the change applies within about a minute. DESKTOP_USERS still works as before.
+_EXTRA = {"users": set(), "t": 0.0, "busy": False, "note": ""}
+
+
+def _refresh_extra():
+    try:
+        from relay_continuity import _gh_get_sync
+        data, _sha = _gh_get_sync("config/desktop-users.json")
+        if data is None:
+            _EXTRA["note"] = "config/desktop-users.json not found"
+        else:
+            users = data.get("users", []) if isinstance(data, dict) else data
+            _EXTRA["users"] = {str(u).strip().lower() for u in users if str(u).strip()}
+            _EXTRA["note"] = f"{len(_EXTRA['users'])} from config/desktop-users.json"
+    except Exception as e:                              # noqa: BLE001
+        _EXTRA["note"] = "could not read config/desktop-users.json: " + str(e)[:80]
+    finally:
+        _EXTRA["t"] = time.time()
+        _EXTRA["busy"] = False
+
+
+def desktop_users() -> set:
+    if LOG_REPO and LOG_TOKEN and not _EXTRA["busy"] and time.time() - _EXTRA["t"] > 60:
+        import threading
+        _EXTRA["busy"] = True
+        threading.Thread(target=_refresh_extra, daemon=True).start()
+    return DESKTOP_USERS | _EXTRA["users"]
+
+
 def desktop_allowed(sessions: dict, x_session) -> bool:
-    if "*" in DESKTOP_USERS:
+    allowed = desktop_users()
+    if "*" in allowed:
         return True
     user = str((sessions.get(x_session or "") or {}).get("user", "")).strip().lower()
-    return bool(user) and user in DESKTOP_USERS
+    return bool(user) and user in allowed
+
+
+# v28: an RTU is marked as toning while a Uni-dir tone runs, so the desktop light shows it as testing.
+TONING: dict[str, dict] = {}          # rtuId -> {"until": epoch, "user": name, "fibre": str}
+
+
+def mark_toning(rtu_id, seconds: float, user: str = "", fibre: str = ""):
+    if rtu_id:
+        TONING[str(rtu_id)] = {"until": time.time() + float(seconds or 0) + 2, "user": user, "fibre": fibre}
+
+
+def toning_now() -> list[dict]:
+    now = time.time()
+    for k in [k for k, v in TONING.items() if v["until"] < now - 60]:
+        TONING.pop(k, None)
+    return [{"rtuId": k, **v} for k, v in TONING.items() if v["until"] >= now]
 
 
 def require_desktop(sessions: dict, x_session):
@@ -247,13 +295,23 @@ def make_router(valid_token, check_key, sessions: dict, relay_version: str) -> A
         pl = ((first.get("Payload") or {}).get("payLoad") or {})
         if kind == "OTDR":
             wl = {v: k for k, v in WAVELENGTHS.items()}.get(str(pl.get("wavelength")), pl.get("wavelength"))
-            setting = f"{wl} nm, {pl.get('duration')} s, " + ("auto" if pl.get("autoSettings") else
-                                                              f"pulse {pl.get('pulse')}, range {pl.get('range')} m")
+            setting = f"{wl} nm · {pl.get('duration')} s"          # v28: plain words, auto pulse and range not mentioned
+            if not pl.get("autoSettings"):
+                try:
+                    ns = float(pl.get("pulse")) * 1e9
+                    pulse = f"{ns / 1000:g} µs" if ns >= 1000 else f"{ns:g} ns"
+                except Exception:                       # noqa: BLE001
+                    pulse = str(pl.get("pulse"))
+                try:
+                    rng = f"{float(pl.get('range')) / 1000:g} km"
+                except Exception:                       # noqa: BLE001
+                    rng = str(pl.get("range"))
+                setting += f" · {pulse} pulse · {rng}"
         else:
             mode = {v: IOLM_MODE_LABELS[k] for k, v in IOLM_MODES.items()}.get(first.get("MeasurementType"),
                                                                               first.get("MeasurementType"))
             wls = "/".join(str(round(float(w) * 1e9)) for w in first.get("WavelengthsUsed") or [])
-            setting = f"{mode}, {wls} nm, setup {first.get('TestConfigId')}"
+            setting = f"{mode} · {wls.replace('/', ', ')} nm"     # v28: the FMS test limit number is left out
         return {"id": wf.get("workflowId", ""), "status": wf.get("status"), "kind": kind, "setting": setting,
                 "rtuId": str(first.get("RtuId") or ""), "rtuName": rtu_name(fms, first.get("RtuId")), "creator": inp.get("creatorName") or "",
                 "owner": _owner(inp.get("creatorName") or inp.get("UserName") or ""),
@@ -302,7 +360,7 @@ def make_router(valid_token, check_key, sessions: dict, relay_version: str) -> A
             data["running"] = [t for t in data["running"] if t["rtuId"] == str(rid)]
             data["byRtu"] = {k: v for k, v in data["byRtu"].items() if k == str(rid)}
         return {"ok": True, "me": me(x_session), "cancelPolicy": CANCEL_POLICY,
-                "cancelled": CANCELLED[:20], **data}
+                "cancelled": CANCELLED[:20], "toning": toning_now(), **data}
 
     @router.post("/api/tasks/cancel")
     async def cancel(body: CancelIn, x_app_key: str | None = Header(default=None),
