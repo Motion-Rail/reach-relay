@@ -71,6 +71,9 @@ class UniLiveIn(BaseModel):
     location: str = ""
     started: float = 0
     ended: bool = False
+    doneList: list[int] = []      # v31: fibres confirmed so far, for the Fibres screen in real time
+    disList: list[int] = []
+    crossList: list[int] = []
 
 
 class HistoryIn(BaseModel):
@@ -89,6 +92,7 @@ class UniIn(BaseModel):
     confirmed: int = 0
     dis: list[str] = []
     cross: list[str] = []
+    doneList: list[int] = []          # v31: the confirmed fibre numbers, for the Fibres screen
     issues: int = 0
     started: float = 0
     ended: float = 0
