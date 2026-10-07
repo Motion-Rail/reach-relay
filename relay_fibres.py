@@ -36,7 +36,7 @@ MAX_TASKS = max(20, int(os.getenv("FIBRES_MAX_TASKS", "300")))
 BASE_TTL = 60            # seconds the grid is kept before the logs and Tasks are read again
 LIVE_TTL = 4             # running Tasks are read at most this often
 
-WF_PARSED: dict[str, dict] = {}       # finished workflow id -> parsed Task (never changes)
+WF_PARSED: dict[str, dict] = {}       # finished workflow id -> parsed Task (never changes); routes kept compact (v34)
 LOG_FILES: dict[str, dict] = {}       # file sha -> parsed log (never changes)
 DIRS: dict[str, dict] = {}            # dir path -> {"t", "items"}
 BASE: dict[str, dict] = {}            # stem -> {"t", "data"}
@@ -64,6 +64,36 @@ def _when(v) -> float:
         return datetime.fromisoformat(s.replace("Z", "+00:00")).timestamp()
     except Exception:                                   # noqa: BLE001
         return 0.0
+
+
+# ── v34: memory. 300 Tasks of 432 fibres as plain dicts took ~100 MB on a 512 MB relay, so routes are
+#    kept as small tuples read by key, and the other caches are capped. ──
+_RK = {k: i for i, k in enumerate(("fibre", "stem", "rtuId", "routeId", "status", "len", "loss", "t", "message"))}
+
+
+class _Route(tuple):
+    __slots__ = ()
+
+    def __getitem__(self, k):
+        return tuple.__getitem__(self, _RK[k] if isinstance(k, str) else k)
+
+    def get(self, k, d=None):
+        i = _RK.get(k)
+        return d if i is None else tuple.__getitem__(self, i)
+
+
+def _compact(p: dict) -> dict:
+    p = dict(p)
+    p["routes"] = [_Route((r["fibre"], sys.intern(r["stem"]), sys.intern(r["rtuId"]), sys.intern(r["routeId"]),
+                           sys.intern(r["status"]), r["len"], r["loss"], r["t"], r["message"] or ""))
+                   for r in p.get("routes", [])]
+    return p
+
+
+def _cap(d: dict, n: int):
+    """Drop the oldest entries (insertion order) so a cache never holds more than n."""
+    while len(d) > n:
+        d.pop(next(iter(d)), None)
 
 
 def _fib(name: str) -> int:
@@ -168,7 +198,7 @@ def scan_tasks(token: str) -> str:
                 p = parse_wf(fms.workflow(wid, tasks=True))
             except Exception:                           # noqa: BLE001
                 p = None
-            WF_PARSED[wid] = p or {"routes": []}
+            WF_PARSED[wid] = _compact(p) if p else {"routes": []}
         if old or len(rows) < 50:
             break
         start += 50
@@ -204,6 +234,7 @@ def _list(path: str, ttl: float) -> list[dict]:
         return c["items"]
     items = _gh_list_sync(path)
     DIRS[path] = {"t": time.time(), "items": items}
+    _cap(DIRS, 300)
     return items
 
 
@@ -215,6 +246,7 @@ def _read(item: dict) -> dict | None:
     rep, _ = _gh_get_sync(item["path"])
     if rep is not None and sha and rep.get("state") not in ("running", "paused"):
         LOG_FILES[sha] = rep
+        _cap(LOG_FILES, 800)
     return rep
 
 
@@ -448,6 +480,7 @@ def make_router(valid_token, check_key, sessions: dict) -> APIRouter:
         if body.refresh or not b or time.time() - b["t"] > BASE_TTL:
             data = await asyncio.to_thread(build, stem, ends)
             b = BASE[stem] = {"t": time.time(), "data": data}
+            _cap(BASE, 6)
         notes = []
         if not _log_on():
             notes.append("E2E and Uni-dir results need the run logs (LOG_REPO) on the relay.")

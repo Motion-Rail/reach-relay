@@ -44,7 +44,14 @@ _FILE_CACHE: dict[str, dict] = {}     # sha -> parsed row
 _DIR_CACHE: dict[str, dict] = {}      # path -> {"t": ts, "items": [...]}
 _WF_CACHE: dict[str, dict] = {}       # workflowId -> row (finished Tasks only)
 _RTU_NAMES: dict[str, str] = {}
-USER_NAMES: dict[str, str] = {}       # email (lower case) -> name from the FMS token, learnt at sign in
+USER_NAMES: dict[str, str] = {}
+
+
+def _cap(d: dict, n: int):
+    """v34: drop the oldest entries so a cache never holds more than n."""
+    while len(d) > n:
+        d.pop(next(iter(d)), None)
+       # email (lower case) -> name from the FMS token, learnt at sign in
 SEARCH = (fc.WF_BASE + "/workflow/search?start=0&size={size}&sort=startTime:DESC&freeText=*"
           "&query=workflowType%20IN%20(" + fc.WF_NAME + ")%20AND%20status%20IN%20({status})")
 
@@ -384,6 +391,7 @@ def make_router(valid_token, check_key, sessions: dict, rtu_index: dict, relay_v
             return c["items"]
         items = _gh_list_sync(path)
         _DIR_CACHE[path] = {"t": time.time(), "items": items}
+        _cap(_DIR_CACHE, 300)
         return items
 
     def read_file(item: dict) -> dict | None:
@@ -394,6 +402,7 @@ def make_router(valid_token, check_key, sessions: dict, rtu_index: dict, relay_v
         row = log_row(rep, item["path"]) if rep else None
         if row and row["result"] != "Running":
             _FILE_CACHE[sha] = row
+            _cap(_FILE_CACHE, 1500)
         return row
 
     def log_rows(days: int) -> tuple[list[dict], str]:
@@ -453,6 +462,7 @@ def make_router(valid_token, check_key, sessions: dict, rtu_index: dict, relay_v
                         continue
                     if row["status"] != "RUNNING":
                         _WF_CACHE[wid] = row
+                        _cap(_WF_CACHE, 600)
                 if row["started"] and row["started"] < cutoff:
                     continue
                 if row["type"] == "FMS OTDR" and "continuity" in row["summary"].lower() and row["scope"].endswith("(1)"):

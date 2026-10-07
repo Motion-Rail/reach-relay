@@ -149,6 +149,8 @@ def _fire(fms, s: dict) -> dict:
             w.subscribe(fc.ADHOC_TOPIC.format(route=int(s["routeId"]), promise=pid))
         except Exception:                               # noqa: BLE001
             s["_watch"] = None
+    s.setdefault("pids", []).append(pid)
+    del s["pids"][:-400]
     return {"pid": pid, "t0": t0}
 
 
@@ -214,6 +216,15 @@ def _read(fms, rid: str, t0: float) -> dict:
               for e in (om.get("Events") or []) if _num(e.get("Position")) is not None]
     return {"t": time.time(), "secs": round(time.time() - t0, 1), "resultId": rid, "testTime": md.get("TestTime"),
             "len": link, "trace": reduce_trace(vals, res_m, first, link), "events": events[:40]}
+
+
+def _when(v) -> float:
+    from relay_fibres import _when as w
+    return w(v)
+
+
+def _live_pids() -> set:
+    return {p for s in SESSIONS_L.values() for p in s.get("pids", [])}
 
 
 def _take(s: dict, shot: dict):
@@ -292,6 +303,18 @@ class IdIn(BaseModel):
     seconds: int = 0
 
 
+class FibreIn(BaseModel):
+    stem: str
+    fibre: int
+
+
+class TraceIn(BaseModel):
+    resultId: str
+
+
+TRACES: dict[str, dict] = {}          # result id -> reduced trace (stored results never change)
+
+
 def _secs(v: int) -> int:
     return int(v) if int(v or 0) in SHOT_CHOICES else SHOT_S
 
@@ -328,6 +351,9 @@ def make_router(valid_token, check_key, sessions: dict) -> APIRouter:
              "routeId": end["routes"][str(body.fibre)], "started": time.time(), "until": time.time() + mins * 60,
              "count": 0, "error": "", "note": "", "ref": None, "latest": None, "shots": [], "ended": None,
              "session": x_session, "shotS": _secs(body.seconds)}
+        for k, o in list(SESSIONS_L.items()):           # v34: forget sessions that ended over an hour ago
+            if o.get("ended") and time.time() - o["ended"] > 3600:
+                SESSIONS_L.pop(k, None)
         SESSIONS_L[sid] = s
         loop = asyncio.get_event_loop()
 
@@ -344,6 +370,68 @@ def make_router(valid_token, check_key, sessions: dict) -> APIRouter:
         if not s:
             raise HTTPException(404, "That live OTDR has ended (the service restarted)")
         return public(s, full=body.have != s["count"])
+
+    # ── v41: stored OTDR traces of one fibre (both ends), and one trace to view ──
+    @router.post("/api/otdr/traces")
+    async def traces(body: FibreIn, x_app_key: str | None = Header(default=None), x_session: str | None = Header(default=None)):
+        check_key(x_app_key)
+        token = await valid_token(x_session)
+        require_desktop(sessions, x_session)
+        stem = body.stem.strip().upper()
+        if not 1 <= body.fibre <= 432:
+            raise HTTPException(400, "Fibre must be 1 to 432")
+        import relay_fibres
+        ends = await relay_fibres.ensure_ends(token, stem)
+
+        def fetch():
+            import relay_bulk
+            fms = relay_bulk.FMS_FOR(token) if relay_bulk.FMS_FOR else fc.Fms(token)
+            rows, pids = [], _live_pids()
+            for e in ends[:2]:
+                rid = e["routes"].get(str(body.fibre))
+                if not rid:
+                    continue
+                params = {"$filter": f"metadata/AssetId eq {int(rid)} and metadata/TestCategory eq 'Adhoc' and metadata/TestType eq 'OTDR'",
+                          "$orderby": "metadata/TestTime desc", "$top": "40", "$skip": "0", "$select": "resultid,metadata,brief/LinkResults"}
+                r = fms.get(fc.RESULTS_URL, params=params)
+                r.raise_for_status()
+                j = r.json()
+                for x in j.get("results", j if isinstance(j, list) else []):
+                    md = x.get("metadata") or {}
+                    if md.get("HasError"):
+                        continue
+                    lr = (x.get("brief") or {}).get("LinkResults") or {}
+                    res = (lr.get("Results") or [{}])[0]
+                    rows.append({"resultId": x.get("resultid"), "t": _when(md.get("TestTime")), "rtuId": e["rtuId"], "rtu": e["rtu"],
+                                 "len": _num(lr.get("Length")), "loss": _num(res.get("Loss")), "wl": res.get("Wavelength") or "",
+                                 "live": bool(md.get("PromiseId")) and md.get("PromiseId") in pids})
+            rows.sort(key=lambda r: -r["t"])
+            return rows
+        try:
+            rows = await asyncio.to_thread(fetch)
+        except Exception as e:                          # noqa: BLE001
+            raise HTTPException(502, "FMS traces could not be read: " + str(e)[:120]) from None
+        return {"stem": stem, "fibre": body.fibre, "traces": rows}
+
+    @router.post("/api/otdr/trace")
+    async def trace(body: TraceIn, x_app_key: str | None = Header(default=None), x_session: str | None = Header(default=None)):
+        check_key(x_app_key)
+        token = await valid_token(x_session)
+        require_desktop(sessions, x_session)
+        rid = body.resultId.strip()
+        if not re.fullmatch(r"[A-Za-z0-9_-]{4,64}", rid):
+            raise HTTPException(400, "That is not a result id")
+        if rid not in TRACES:
+            import relay_bulk
+            fms = relay_bulk.FMS_FOR(token) if relay_bulk.FMS_FOR else fc.Fms(token)
+            try:
+                t = await asyncio.to_thread(_read, fms, rid, time.time())
+            except Exception as e:                      # noqa: BLE001
+                raise HTTPException(502, str(e)[:160]) from None
+            if len(TRACES) > 60:
+                TRACES.pop(next(iter(TRACES)))
+            TRACES[rid] = {k: t[k] for k in ("resultId", "testTime", "len", "trace", "events")}
+        return TRACES[rid]
 
     @router.post("/api/otdr/live/settings")
     async def settings(body: IdIn, x_app_key: str | None = Header(default=None), x_session: str | None = Header(default=None)):
