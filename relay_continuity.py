@@ -48,12 +48,12 @@ PACE = {                              # measured on RGAC2 -> SNBC, 28 Sep 2026
     "clash_s": 10,                    # live fibre refused: the PASS
     "clean_s": 35,                    # dark fibre, full OTDR runs
     "first_test_s": 53,
-    "default_otdr_s": 3,
+    "default_otdr_s": 1,               # v35 (8 Oct): EXFO best results, tone 4 s / OTDR 1 s / 1550 nm / 330 Hz
     # v15, measured on R1/R2 28 Sep 2026: straight cycle 12.8 s at tone 6 or 10 (lead 2);
     # the tone only adds time above ~11 s. Tone 10 gives more cover for slow FMS starts.
     # Dark OTDR: 3 s -> 17.4-18.5 s; 5 s -> 17.5-18.5 s; 1 s -> 14-35 s (erratic).
     # Lead 1 s saved ~0.9 s a fibre but missed the first fibre once; kept at 2 s.
-    "default_tone_s": 10,
+    "default_tone_s": 4,
     "default_lead_s": 2,
     "max_tone_s": 20,
     "cover_tone_s": 20,               # first test of a run, and a retry after a miss
@@ -64,7 +64,7 @@ PACE = {                              # measured on RGAC2 -> SNBC, 28 Sep 2026
     "outage_wait_s": 60,              # v22: FMS not answering: wait, then retry the same test
     "outage_limit_s": 7200,           #      give up (run fails, resumable) after 2 h                # v20: acquisition must start at least this long before the tone ends              # v18: a dark result later than tone start + tone + this is rechecked
 }
-RELAY_VERSION = "v34"   # kept in step with main.py
+RELAY_VERSION = "v35"   # kept in step with main.py
 JOBS: dict[str, dict] = {}
 LOCKS: dict[str, asyncio.Lock] = {}
 ROUTES: dict[str, dict[str, dict]] = {}          # rtuName -> {routeName: node}
@@ -113,7 +113,7 @@ class TestReq(BaseModel):
     stem: str = "F-RGAC-SNBC-A-R432"
     toneS: int = PACE["default_tone_s"]
     wavelengthNm: int = 1550
-    freqHz: int = 0
+    freqHz: int = 330
     durationS: int = PACE["default_otdr_s"]
 
 
@@ -128,7 +128,7 @@ class StartReq(BaseModel):
     leadS: float = PACE["default_lead_s"]
     autoPace: bool = True             # lengthen the tone if the expected fibre misses
     wavelengthNm: int = 1550
-    freqHz: int = 0
+    freqHz: int = 330
     simulate: str | None = None       # testing only; not offered in the app since v14
     appVersion: str = ""
     prior: dict[str, dict] | None = None   # v17 resume: {"12": {"state": "straight", "found": 12}}
