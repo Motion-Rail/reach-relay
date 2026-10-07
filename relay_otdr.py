@@ -227,6 +227,72 @@ def _live_pids() -> set:
     return {p for s in SESSIONS_L.values() for p in s.get("pids", [])}
 
 
+def _one(fms, rid: str, select: str) -> dict | None:
+    r = fms.get(fc.RESULTS_URL, params={"$filter": f"resultid eq {rid}", "$top": "1", "$skip": "0", "$select": select})
+    r.raise_for_status()
+    j = r.json()
+    return next(iter(j.get("results", j if isinstance(j, list) else [])), None)
+
+
+def _related_ids(md: dict) -> list[str]:
+    out = []
+    for x in md.get("RelatedResults") or []:
+        v = x if isinstance(x, str) else (x.get("ResultId") or x.get("resultid") or x.get("resultId") or x.get("Id") or "") if isinstance(x, dict) else ""
+        if v:
+            out.append(str(v))
+    return out
+
+
+def _read_any(fms, rid: str) -> dict:
+    """v36: an OTDR result gives its own trace. An iOLM result has no trace of its own: FMS can extract the OTDR
+    traces it was built from (POST .../otdr/extract, then metadata.RelatedResults); the 1550 one is drawn, and the
+    iOLM link elements become the event list. If FMS gives no trace, the events are still returned."""
+    head = _one(fms, rid, "resultid,metadata,brief/LinkResults")
+    if not head:
+        raise RuntimeError("That result was not found in FMS.")
+    md = head.get("metadata") or {}
+    if str(md.get("TestType") or "").upper() != "IOLM":
+        return {**_read(fms, rid, time.time()), "kind": "OTDR"}
+    full = _one(fms, rid, "resultid,metadata,brief/LinkResults,brief/Measurement/Elements") or head
+    lr = (full.get("brief") or {}).get("LinkResults") or {}
+    length = _num(lr.get("Length"))
+    events = []
+    for el in ((full.get("brief") or {}).get("Measurement") or {}).get("Elements") or []:
+        if str(el.get("Status") or "") in ("LinkStart", "LinkEnd"):
+            continue
+        pos = _num(el.get("Position"))
+        if pos is None:
+            continue
+        m = pos * 1000 if pos < 1000 else pos                   # iOLM positions come in km
+        rs = el.get("Results") or []
+        q = next((x for x in rs if str(x.get("Wavelength")) == "1550"), rs[0] if rs else {})
+        events.append({"m": round(m), "loss": _num(q.get("Loss")), "type": el.get("Type") or ""})
+    rel = _related_ids(md)
+    if not rel:
+        try:
+            fms.post(fc.RESULTS_URL.rstrip("/") + f"/{rid}/otdr/extract", json={})
+            again = _one(fms, rid, "resultid,metadata")
+            rel = _related_ids((again or {}).get("metadata") or {})
+        except Exception:                               # noqa: BLE001
+            rel = []
+    best, note = None, ""
+    for r2 in rel[:4]:
+        try:
+            t = _read(fms, r2, time.time())
+        except Exception:                               # noqa: BLE001
+            continue
+        wl = str(((_one(fms, r2, "resultid,brief/LinkResults") or {}).get("brief") or {}).get("LinkResults", {}).get("Results", [{}])[0].get("Wavelength") or "")
+        if best is None or wl == "1550":
+            best = {**t, "wl": wl}
+        if wl == "1550":
+            break
+    if not best:
+        note = "FMS gave no OTDR trace for this iOLM result, so only its events are shown."
+    return {"resultId": rid, "testTime": md.get("TestTime"), "len": length or (best or {}).get("len"),
+            "trace": (best or {}).get("trace"), "events": events[:60], "kind": "iOLM", "note": note,
+            "traceOf": (best or {}).get("resultId", "")}
+
+
 def _take(s: dict, shot: dict):
     if s["ref"] is None:
         s["ref"] = shot
@@ -312,6 +378,16 @@ class TraceIn(BaseModel):
     resultId: str
 
 
+class OnceIn(BaseModel):
+    stem: str
+    fibre: int
+    rtuId: str
+    seconds: int = 10
+
+
+ONCE_CHOICES = (5, 10, 15, 30, 60)
+
+
 TRACES: dict[str, dict] = {}          # result id -> reduced trace (stored results never change)
 
 
@@ -391,19 +467,23 @@ def make_router(valid_token, check_key, sessions: dict) -> APIRouter:
                 rid = e["routes"].get(str(body.fibre))
                 if not rid:
                     continue
-                params = {"$filter": f"metadata/AssetId eq {int(rid)} and metadata/TestCategory eq 'Adhoc' and metadata/TestType eq 'OTDR'",
-                          "$orderby": "metadata/TestTime desc", "$top": "40", "$skip": "0", "$select": "resultid,metadata,brief/LinkResults"}
+                params = {"$filter": f"metadata/AssetId eq {int(rid)} and metadata/TestCategory eq 'Adhoc'",   # v36: OTDR and iOLM
+                          "$orderby": "metadata/TestTime desc", "$top": "50", "$skip": "0", "$select": "resultid,metadata,brief/LinkResults"}
                 r = fms.get(fc.RESULTS_URL, params=params)
                 r.raise_for_status()
                 j = r.json()
                 for x in j.get("results", j if isinstance(j, list) else []):
                     md = x.get("metadata") or {}
-                    if md.get("HasError"):
+                    kind = str(md.get("TestType") or "").upper()
+                    if md.get("HasError") or kind not in ("OTDR", "IOLM"):
                         continue
                     lr = (x.get("brief") or {}).get("LinkResults") or {}
-                    res = (lr.get("Results") or [{}])[0]
+                    rs = lr.get("Results") or [{}]
+                    pick = next((q for q in rs if str(q.get("Wavelength")) == "1550"), rs[0])
                     rows.append({"resultId": x.get("resultid"), "t": _when(md.get("TestTime")), "rtuId": e["rtuId"], "rtu": e["rtu"],
-                                 "len": _num(lr.get("Length")), "loss": _num(res.get("Loss")), "wl": res.get("Wavelength") or "",
+                                 "kind": "iOLM" if kind == "IOLM" else "OTDR",
+                                 "len": _num(lr.get("Length")), "loss": _num(pick.get("Loss")), "wl": pick.get("Wavelength") or "",
+                                 "wls": [str(q.get("Wavelength")) for q in rs if q.get("Wavelength")],
                                  "live": bool(md.get("PromiseId")) and md.get("PromiseId") in pids})
             rows.sort(key=lambda r: -r["t"])
             return rows
@@ -412,6 +492,49 @@ def make_router(valid_token, check_key, sessions: dict) -> APIRouter:
         except Exception as e:                          # noqa: BLE001
             raise HTTPException(502, "FMS traces could not be read: " + str(e)[:120]) from None
         return {"stem": stem, "fibre": body.fibre, "traces": rows}
+
+    # ── v36: one OTDR on a fibre now (direct ad hoc call, no FMS Task), the trace comes straight back ──
+    @router.post("/api/otdr/once")
+    async def once(body: OnceIn, x_app_key: str | None = Header(default=None), x_session: str | None = Header(default=None)):
+        check_key(x_app_key)
+        token = await valid_token(x_session)
+        require_desktop(sessions, x_session)
+        user, owner = mine(x_session)
+        stem = body.stem.strip().upper()
+        if not 1 <= body.fibre <= 432:
+            raise HTTPException(400, "Fibre must be 1 to 432")
+        if body.seconds not in ONCE_CHOICES:
+            raise HTTPException(400, "OTDR length must be one of " + ", ".join(map(str, ONCE_CHOICES)) + " s")
+        import relay_fibres
+        import relay_bulk
+        ends = await relay_fibres.ensure_ends(token, stem)
+        end = next((e for e in ends if e["rtuId"] == str(body.rtuId)), None)
+        if not end or not end["routes"].get(str(body.fibre)):
+            raise HTTPException(404, "That fibre was not found on that RTU in FMS")
+        why = _busy(end["rtuId"], end["rtu"])
+        if why:
+            raise HTTPException(409, why + ". Try again when it is free.")
+        s = {"state": "running", "rtuId": end["rtuId"], "routeId": end["routes"][str(body.fibre)], "shotS": body.seconds,
+             "user": user, "fibreName": f"{stem}-F{body.fibre:03d}"}
+        fms = relay_bulk.FMS_FOR(token) if relay_bulk.FMS_FOR else fc.Fms(token)
+
+        def go():
+            relay_bulk.mark_toning(s["rtuId"], body.seconds + 60, user, s["fibreName"])
+            try:
+                shot = _fire(fms, s)
+                rid = _await(fms, s, shot)
+                return _read(fms, rid, shot["t0"])
+            finally:
+                relay_bulk.TONING.pop(str(s["rtuId"]), None)
+        try:
+            t = await asyncio.to_thread(go)
+        except RuntimeError as e:
+            raise HTTPException(502, str(e)[:200]) from None
+        TRACES[t["resultId"]] = {k: t[k] for k in ("resultId", "testTime", "len", "trace", "events")}
+        if len(TRACES) > 60:
+            TRACES.pop(next(iter(TRACES)))
+        return {**TRACES[t["resultId"]], "secs": t["secs"], "rtu": end["rtu"], "rtuId": end["rtuId"], "seconds": body.seconds,
+                "by": owner, "t": time.time()}
 
     @router.post("/api/otdr/trace")
     async def trace(body: TraceIn, x_app_key: str | None = Header(default=None), x_session: str | None = Header(default=None)):
@@ -425,12 +548,12 @@ def make_router(valid_token, check_key, sessions: dict) -> APIRouter:
             import relay_bulk
             fms = relay_bulk.FMS_FOR(token) if relay_bulk.FMS_FOR else fc.Fms(token)
             try:
-                t = await asyncio.to_thread(_read, fms, rid, time.time())
+                t = await asyncio.to_thread(_read_any, fms, rid)
             except Exception as e:                      # noqa: BLE001
                 raise HTTPException(502, str(e)[:160]) from None
             if len(TRACES) > 60:
                 TRACES.pop(next(iter(TRACES)))
-            TRACES[rid] = {k: t[k] for k in ("resultId", "testTime", "len", "trace", "events")}
+            TRACES[rid] = {k: t.get(k) for k in ("resultId", "testTime", "len", "trace", "events", "kind", "note", "traceOf")}
         return TRACES[rid]
 
     @router.post("/api/otdr/live/settings")

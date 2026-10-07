@@ -51,7 +51,7 @@ MEAS_PAYLOAD_TEMPLATE = os.getenv(
 SETUP_NAME  = os.getenv("SETUP_NAME", "")
 PAGE_SIZE   = int(os.getenv("PAGE_SIZE", "50"))
 
-RELAY_VERSION = "v35"
+RELAY_VERSION = "v36"
 
 # ── relay access ─────────────────────────────────────────────────────────────
 APP_KEY    = os.getenv("APP_KEY", "")
@@ -71,10 +71,30 @@ app = FastAPI(title="Fibre Tone Tester relay")
 app.add_middleware(
     CORSMiddleware,
     allow_origins=ALLOWED_ORIGINS,
-    allow_methods=["*"], allow_headers=["*"],
+    allow_methods=["*"], allow_headers=["*"], expose_headers=["Content-Disposition"],
 )
 
 SESSIONS: dict[str, dict] = {}          # session_id -> {access, refresh, exp, user}
+
+
+# ── v36: stay signed in through restarts (see relay_resume.py) ──
+from relay_resume import resume_blob as _resume_blob, read_blob as _read_resume
+RESUMED = {"n": 0, "failed": 0}
+
+
+@app.middleware("http")
+async def _resume_mw(request, call_next):
+    sid = request.headers.get("x-session") or ""
+    blob = request.headers.get("x-resume") or ""
+    if sid and blob and sid not in SESSIONS:
+        rec = _read_resume(blob, sid)
+        if rec:
+            try:
+                _store(sid, await _refresh_grant(rec["refresh"]), rec["user"])
+                RESUMED["n"] += 1
+            except Exception:                           # noqa: BLE001
+                RESUMED["failed"] += 1
+    return await call_next(request)
 ROUTE_ID_CACHE: dict[str, dict] = {}    # "RTUID|FIBRENAME" -> {"id","rtuId","rtuName","site"}
 RTU_INDEX: dict[str, dict] = {}         # rtuId -> {"rtuName","site"}
 
@@ -274,7 +294,7 @@ async def login(body: LoginIn, x_app_key: str | None = Header(default=None)):
     tok = await _password_grant(body.username, body.password)
     sid = uuid.uuid4().hex
     _store(sid, tok, body.username)
-    return {"session_id": sid, "user": body.username}
+    return {"session_id": sid, "user": body.username, "resume": _resume_blob(sid, SESSIONS.get(sid))}
 
 @app.post("/api/routes")
 async def routes(body: PrimeIn, x_app_key: str | None = Header(default=None),
@@ -451,3 +471,7 @@ app.include_router(_otdr_router(_valid_token, _check_key, SESSIONS))
 # ── v33: a finished Task's result files (.sor) as one zip (see relay_files.py) ──
 from relay_files import make_router as _files_router
 app.include_router(_files_router(_valid_token, _check_key, SESSIONS))
+
+# ── v36: cable report as an Excel workbook (see relay_report.py) ──
+from relay_report import make_router as _report_router
+app.include_router(_report_router(_valid_token, _check_key, SESSIONS))

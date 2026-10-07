@@ -316,7 +316,9 @@ def make_router(valid_token, check_key, sessions: dict, rtu_index: dict, relay_v
         people = sorted(latest.values(), key=lambda v: (not v["you"], v["name"].lower()))
         token = await valid_token(x_session)
         tasks = await asyncio.to_thread(fms_running, token)
-        return {"ok": True, "now": now, "ttl": PRESENCE_TTL, "people": people,
+        from relay_resume import resume_blob
+        resume = resume_blob(x_session, sessions.get(x_session or ""))    # v36: fresh resume code, latest refresh token
+        return {"ok": True, "now": now, "ttl": PRESENCE_TTL, "people": people, "resume": resume,
                 "runs": app_runs(), "fmsTasks": tasks, "relayVersion": relay_version}
 
     @router.post("/api/uni/live")
