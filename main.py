@@ -51,7 +51,7 @@ MEAS_PAYLOAD_TEMPLATE = os.getenv(
 SETUP_NAME  = os.getenv("SETUP_NAME", "")
 PAGE_SIZE   = int(os.getenv("PAGE_SIZE", "50"))
 
-RELAY_VERSION = "v32"
+RELAY_VERSION = "v33"
 
 # ── relay access ─────────────────────────────────────────────────────────────
 APP_KEY    = os.getenv("APP_KEY", "")
@@ -447,3 +447,7 @@ app.include_router(_fibres_router(_valid_token, _check_key, SESSIONS))
 # ── v32: live OTDR on one fibre, trace after trace (see relay_otdr.py) ──
 from relay_otdr import make_router as _otdr_router
 app.include_router(_otdr_router(_valid_token, _check_key, SESSIONS))
+
+# ── v33: a finished Task's result files (.sor) as one zip (see relay_files.py) ──
+from relay_files import make_router as _files_router
+app.include_router(_files_router(_valid_token, _check_key, SESSIONS))

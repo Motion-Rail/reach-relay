@@ -35,13 +35,14 @@ from pydantic import BaseModel
 
 import fms_continuity as fc
 
-SHOT_S = max(1, int(os.getenv("LIVE_OTDR_S", "5")))
+SHOT_S = max(1, int(os.getenv("LIVE_OTDR_S", "3")))           # v34: 3 s by default (was 5); 1 to 10 per session
 MINUTES = max(1, int(os.getenv("LIVE_OTDR_MINUTES", "10")))
 TRACE_FORMAT = os.getenv("TRACE_FORMAT", "uint16le").strip().lower()
 TRACE_SCALE = float(os.getenv("TRACE_SCALE", "0.001"))
 BINS = 1500
 STEP_DB = float(os.getenv("LIVE_OTDR_STEP_DB", "0.15"))     # smallest new loss worth marking
-GAP_S = float(os.getenv("LIVE_OTDR_GAP_S", "1"))            # pause between shots
+POLL_S = float(os.getenv("LIVE_OTDR_POLL_S", "1"))          # results list check while waiting (the push is quicker)
+SHOT_CHOICES = (1, 2, 3, 5, 10)
 
 SESSIONS_L: dict[str, dict] = {}     # session id -> session
 
@@ -132,43 +133,76 @@ def _busy(rtu_id: str, rtu_name: str) -> str:
     return ""
 
 
-def _shot(fms, s: dict) -> dict:
-    """One OTDR: start it, wait for the stored result, read the trace."""
-    t0 = time.time()
+def _fire(fms, s: dict) -> dict:
+    """Start one OTDR. Returns {pid, t0}. Subscribes the push channel first when it is open."""
     url = fc.ADHOC_URL.format(rtu=int(s["rtuId"]), route=int(s["routeId"]))
-    r = fms.post(url, json=fc.adhoc_payload(SHOT_S))
+    t0 = time.time()
+    r = fms.post(url, json=fc.adhoc_payload(int(s.get("shotS") or SHOT_S)))
     if r.status_code == 409 or "AlreadyScheduled" in r.text:
         raise RuntimeError("The RTU is busy with another test. Waiting.")
     if not r.ok:
         raise RuntimeError(f"FMS refused the OTDR ({r.status_code}): {r.text[:160]}")
     pid = r.text.strip().strip('"')
-    found = None
+    w = s.get("_watch")
+    if w:
+        try:
+            w.subscribe(fc.ADHOC_TOPIC.format(route=int(s["routeId"]), promise=pid))
+        except Exception:                               # noqa: BLE001
+            s["_watch"] = None
+    return {"pid": pid, "t0": t0}
+
+
+def _await(fms, s: dict, shot: dict) -> str:
+    """Wait for that OTDR's stored result id: the push says it at once; the results list is checked every second too."""
+    pid, t0 = shot["pid"], shot["t0"]
+    nxt = t0 + max(1.0, int(s.get("shotS") or SHOT_S) - 0.5)   # nothing can be ready before the shot ends
     while time.time() - t0 < 90 and s["state"] == "running":
-        time.sleep(2)
-        for res in fms.adhoc_results(int(s["routeId"]), top=3):
-            if (res.get("metadata") or {}).get("PromiseId") == pid:
-                found = res
-                break
-        if found:
-            break
-    if not found:
-        raise RuntimeError("No result after 90 s. Light on the fibre (a tone or traffic) stops an OTDR.")
-    md = found.get("metadata") or {}
-    if md.get("HasError"):
-        why = " ".join(fc._strings(found, keys=("message", "messageKey", "error", "errorMessage")))[:200]
-        if fc.LIVE_PATTERNS.search(why):
-            raise RuntimeError("Live light on the fibre: the RTU will not fire an OTDR into it.")
-        raise RuntimeError("The OTDR failed: " + (why or "no reason given"))
-    rid = found.get("resultid")
-    params = {"$filter": f"metadata/AssetId eq {int(s['routeId'])} and metadata/TestCategory eq 'Adhoc' and metadata/TestType eq 'OTDR'",
-              "$orderby": "metadata/TestTime desc", "$top": "3", "$skip": "0",
+        w = s.get("_watch")
+        if w:
+            msg = w.next_message(timeout=0.5)
+            if msg is not None and str(msg.get("promiseId") or "") == pid:
+                if msg.get("isError") or msg.get("error"):
+                    why = msg.get("body") if isinstance(msg.get("body"), str) else str(msg.get("body") or "")
+                    if fc.LIVE_PATTERNS.search(why or ""):
+                        raise RuntimeError("Live light on the fibre: the RTU will not fire an OTDR into it.")
+                    raise RuntimeError("The OTDR failed: " + (why[:160] or "no reason given"))
+                if msg.get("lastTestResultId"):
+                    s["pushOk"] = True
+                    return str(msg["lastTestResultId"])
+        else:
+            time.sleep(0.3)
+        if time.time() >= nxt:
+            nxt = time.time() + POLL_S
+            for res in fms.adhoc_results(int(s["routeId"]), top=3):
+                md = res.get("metadata") or {}
+                if md.get("PromiseId") == pid:
+                    if md.get("HasError"):
+                        why = " ".join(fc._strings(res, keys=("message", "messageKey", "error", "errorMessage")))[:200]
+                        if fc.LIVE_PATTERNS.search(why):
+                            raise RuntimeError("Live light on the fibre: the RTU will not fire an OTDR into it.")
+                        raise RuntimeError("The OTDR failed: " + (why or "no reason given"))
+                    return str(res.get("resultid"))
+    if s["state"] != "running":
+        return ""
+    raise RuntimeError("No result after 90 s. Light on the fibre (a tone or traffic) stops an OTDR.")
+
+
+def _read(fms, rid: str, t0: float) -> dict:
+    """The trace of one stored result, asked for by its id (one small query, not the last three traces)."""
+    params = {"$filter": f"resultid eq {rid}", "$top": "1", "$skip": "0",
               "$select": "resultid,metadata,brief/LinkResults,brief/Measurement/OtdrMeasurements"}
-    rr = fms.get(fc.RESULTS_URL, params=params)
-    rr.raise_for_status()
-    j = rr.json()
-    full = next((x for x in j.get("results", j if isinstance(j, list) else []) if x.get("resultid") == rid), None)
+    full = None
+    for _ in range(3):                                  # the push can be a moment ahead of the store
+        rr = fms.get(fc.RESULTS_URL, params=params)
+        rr.raise_for_status()
+        j = rr.json()
+        full = next(iter(j.get("results", j if isinstance(j, list) else [])), None)
+        if full:
+            break
+        time.sleep(0.7)
     if not full:
         raise RuntimeError("The trace could not be read back from FMS.")
+    md = full.get("metadata") or {}
     om = (((full.get("brief") or {}).get("Measurement") or {}).get("OtdrMeasurements") or [{}])[0]
     dp = om.get("DataPoints") or {}
     link = _num(((full.get("brief") or {}).get("LinkResults") or {}).get("Length"))
@@ -182,36 +216,60 @@ def _shot(fms, s: dict) -> dict:
             "len": link, "trace": reduce_trace(vals, res_m, first, link), "events": events[:40]}
 
 
+def _take(s: dict, shot: dict):
+    if s["ref"] is None:
+        s["ref"] = shot
+    shot["steps"] = compare(s["ref"]["trace"], shot["trace"], s["ref"].get("len") or shot.get("len"))
+    prev = s["latest"]
+    shot["new"] = compare(prev["trace"], shot["trace"], shot.get("len")) if prev else []
+    s["latest"] = shot
+    s["shots"].append({k: shot[k] for k in ("t", "secs", "len", "resultId")} | {"steps": shot["steps"][:2], "shotS": shot.get("shotS")})
+    s["count"] += 1
+
+
 def _loop(s: dict, token_fn):
+    """v34: the next OTDR starts as soon as FMS has stored the last one; its trace is read while the next one runs."""
     import relay_bulk
     fms = fc.Fms.from_token_provider(token_fn, s["user"])
+    s["_watch"] = fc.StompWatch.open(fms)
+    s["push"] = bool(s["_watch"])
+    pending = None                                      # the OTDR now running on the RTU
     while s["state"] == "running":
-        if time.time() > s["until"]:
-            s.update(state="done", note="Stopped after the time limit.")
-            break
         try:
-            relay_bulk.mark_toning(s["rtuId"], SHOT_S + 30, s["user"], s["fibreName"])   # shows as testing everywhere
-            shot = _shot(fms, s)
+            if time.time() > s["until"]:
+                s.update(state="done", note="Stopped after the time limit.")
+                break
+            relay_bulk.mark_toning(s["rtuId"], int(s.get("shotS") or SHOT_S) + 30, s["user"], s["fibreName"])
+            if pending is None:
+                pending = _fire(fms, s)
+            rid = _await(fms, s, pending)
+            if not rid:
+                break
+            done, pending = pending, None
+            shot_s = int(s.get("shotS") or SHOT_S)
+            if s["state"] == "running" and time.time() + shot_s < s["until"]:
+                pending = _fire(fms, s)                 # the RTU is busy again while we read the trace
+            shot = _read(fms, rid, done["t0"])
+            shot["shotS"] = shot_s
+            _take(s, shot)
             s["error"] = ""
-            if s["ref"] is None:
-                s["ref"] = shot
-            shot["steps"] = compare(s["ref"]["trace"], shot["trace"], s["ref"].get("len") or shot.get("len"))
-            prev = s["latest"]
-            shot["new"] = compare(prev["trace"], shot["trace"], shot.get("len")) if prev else []
-            s["latest"] = shot
-            s["shots"].append({k: shot[k] for k in ("t", "secs", "len", "resultId")} | {"steps": shot["steps"][:2]})
-            s["count"] += 1
         except Exception as e:                          # noqa: BLE001
             s["error"] = str(e)[:240]
-            time.sleep(8)
-        time.sleep(GAP_S)
+            pending = None
+            time.sleep(6)
+            if s.get("_watch") is None and s.get("push"):
+                s["_watch"] = fc.StompWatch.open(fms)
+    if s.get("_watch"):
+        s["_watch"].close()
+    s["_watch"] = None
     relay_bulk.TONING.pop(str(s["rtuId"]), None)
     s["ended"] = time.time()
 
 
 def public(s: dict, full: bool = True) -> dict:
     out = {k: s[k] for k in ("id", "state", "owner", "stem", "fibre", "rtuId", "rtuName", "started", "until", "count", "error", "note")}
-    out["shotS"] = SHOT_S
+    out["shotS"] = int(s.get("shotS") or SHOT_S)
+    out["push"] = bool(s.get("pushOk"))
     out["shots"] = s["shots"][-30:]
     if full:
         out["ref"] = s["ref"] and {k: s["ref"][k] for k in ("t", "len", "trace", "events", "resultId")}
@@ -225,10 +283,17 @@ class StartIn(BaseModel):
     rtuId: str
     rtuName: str = ""
     minutes: int = 0
+    seconds: int = 0
 
 
 class IdIn(BaseModel):
     id: str
+    have: int = -1          # v34: the trace count the page already has; traces are only sent when it changed
+    seconds: int = 0
+
+
+def _secs(v: int) -> int:
+    return int(v) if int(v or 0) in SHOT_CHOICES else SHOT_S
 
 
 def make_router(valid_token, check_key, sessions: dict) -> APIRouter:
@@ -262,7 +327,7 @@ def make_router(valid_token, check_key, sessions: dict) -> APIRouter:
              "fibreName": f"{stem}-F{body.fibre:03d}", "rtuId": end["rtuId"], "rtuName": end["rtu"],
              "routeId": end["routes"][str(body.fibre)], "started": time.time(), "until": time.time() + mins * 60,
              "count": 0, "error": "", "note": "", "ref": None, "latest": None, "shots": [], "ended": None,
-             "session": x_session}
+             "session": x_session, "shotS": _secs(body.seconds)}
         SESSIONS_L[sid] = s
         loop = asyncio.get_event_loop()
 
@@ -278,7 +343,19 @@ def make_router(valid_token, check_key, sessions: dict) -> APIRouter:
         s = SESSIONS_L.get(body.id)
         if not s:
             raise HTTPException(404, "That live OTDR has ended (the service restarted)")
-        return public(s)
+        return public(s, full=body.have != s["count"])
+
+    @router.post("/api/otdr/live/settings")
+    async def settings(body: IdIn, x_app_key: str | None = Header(default=None), x_session: str | None = Header(default=None)):
+        check_key(x_app_key)
+        await valid_token(x_session)
+        s = SESSIONS_L.get(body.id)
+        if not s:
+            raise HTTPException(404, "That live OTDR has ended")
+        if body.seconds not in SHOT_CHOICES:
+            raise HTTPException(400, "Shot length must be one of " + ", ".join(map(str, SHOT_CHOICES)) + " s")
+        s["shotS"] = body.seconds                       # used from the next shot
+        return public(s, full=False)
 
     @router.post("/api/otdr/live/stop")
     async def stop(body: IdIn, x_app_key: str | None = Header(default=None), x_session: str | None = Header(default=None)):
