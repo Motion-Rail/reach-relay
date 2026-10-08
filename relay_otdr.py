@@ -235,10 +235,10 @@ def _read(fms, rid: str, t0: float) -> dict:
     res_m = _num(dp.get("Resolution")) or ((_num((om.get("Parameters") or {}).get("Range"), 0) / npts) if npts else 1.0)
     first = _num(dp.get("FirstPointPosition"), 0.0) or 0.0
     vals = decode_points(dp.get("Points") or "")
-    events = [{"m": round(_num(e.get("Position"), 0)), "loss": _num(e.get("Loss")), "type": e.get("Type") or ""}
-              for e in (om.get("Events") or []) if _num(e.get("Position")) is not None]
+    events = event_table(om.get("Events") or [], vals, res_m, first, link)
     return {"t": time.time(), "secs": round(time.time() - t0, 1), "resultId": rid, "testTime": md.get("TestTime"),
-            "len": link, "trace": reduce_trace(vals, res_m, first, link), "events": events[:40]}
+            "len": link, "trace": reduce_trace(vals, res_m, first, link), "events": events,
+            "wl": _wl(om.get("Wavelength"))}
 
 
 def _when(v) -> float:
@@ -249,6 +249,126 @@ def _when(v) -> float:
 def _live_pids() -> set:
     return {p for s in SESSIONS_L.values() for p in s.get("pids", [])}
 
+
+
+def _pick(d: dict, *names):
+    """First of these fields that holds a number (FMS sends numbers as text, NaN included)."""
+    for n in names:
+        v = _num(d.get(n))
+        if v is not None and v == v:
+            return v
+    return None
+
+
+def _slope(vals: list[float], res_m: float, first_m: float, a_m: float, b_m: float) -> float | None:
+    """Fibre attenuation in dB/km between two distances, by a straight line fit through the trace,
+    keeping clear of the events at each end (the dead zones)."""
+    if not vals or not res_m or b_m - a_m < 400:
+        return None
+    pad = min(250.0, (b_m - a_m) * 0.15)
+    i = max(0, int((a_m + pad - first_m) / res_m))
+    j = min(len(vals) - 1, int((b_m - pad - first_m) / res_m))
+    if j - i < 20:
+        return None
+    step = max(1, (j - i) // 4000)
+    xs = [first_m + k * res_m for k in range(i, j + 1, step)]
+    ys = [vals[k] for k in range(i, j + 1, step)]
+    n = len(xs); mx = sum(xs) / n; my = sum(ys) / n
+    sxx = sum((x - mx) ** 2 for x in xs)
+    if not sxx:
+        return None
+    b = sum((x - mx) * (y - my) for x, y in zip(xs, ys)) / sxx
+    att = round(-b * 1000, 3)
+    return att if 0 <= att < 5 else None
+
+
+def event_table(raw: list[dict], vals: list[float], res_m: float, first_m: float, link_m: float | None) -> list[dict]:
+    """v38: the OTDR event table the way the instrument shows it: number, type, distance, section before,
+    event loss, reflectance, section attenuation and cumulative loss from the launch."""
+    rows = []
+    for e in raw or []:
+        m = _pick(e, "Position")
+        if m is None:
+            continue
+        status = str(e.get("Status") or "")
+        rows.append({"m": round(m, 1), "loss": _pick(e, "Loss", "SpliceLoss", "EventLoss"),
+                     "refl": _pick(e, "Reflectance"), "type": e.get("Type") or e.get("TypeCode") or "",
+                     "code": str(e.get("TypeCode") or ""), "status": status,
+                     "att": _pick(e, "Attenuation", "SectionAttenuation"), "cumFms": _pick(e, "CumulativeLoss", "Cumulative")})
+    rows.sort(key=lambda r: r["m"])
+    cum, prev = 0.0, None
+    for n, r in enumerate(rows, 1):
+        r["n"] = n
+        if prev is None:
+            r["sec"] = None
+        else:
+            r["sec"] = round(r["m"] - prev["m"], 1)
+            if r["att"] is None:
+                r["att"] = _slope(vals, res_m, first_m, prev["m"], r["m"])
+            if r["att"] is not None:
+                cum += r["att"] * r["sec"] / 1000
+        launch = "Launch" in str(r["type"]) or "SpanStart" in r["status"]
+        end = "End" in str(r["type"]) and "Fib" in str(r["type"]) or "SpanEnd" in r["status"]
+        if r["loss"] is not None and not launch and not end:
+            cum += r["loss"]
+        r["cum"] = r.pop("cumFms") if r.get("cumFms") is not None else (round(cum, 3) if prev is not None else 0.0)
+        r["launch"], r["end"] = launch, bool(end)
+        prev = r
+    return rows[:80]
+
+
+def _wl(v) -> str:
+    """A wavelength as nm text: FMS gives 1550, "1550" or 1.55e-06 (metres)."""
+    x = _num(v)
+    if x is None or x != x or x <= 0:
+        return "1550"
+    return str(round(x * 1e9) if x < 1e-3 else round(x))
+
+
+def _m(v):
+    """iOLM distances come in km on this FMS; anything under 1000 is km."""
+    x = _num(v)
+    if x is None or x != x:
+        return None
+    return round(x * 1000, 1) if x < 1000 else round(x, 1)
+
+
+def link_view(full: dict) -> dict:
+    """v38: an iOLM result as EXFO's Link View: the elements in order (with the fibre section before each),
+    per wavelength loss and reflectance, verdicts, and the link summary."""
+    b = full.get("brief") or {}
+    lr = b.get("LinkResults") or {}
+    wls = [str(x.get("Wavelength")) for x in (lr.get("Results") or []) if x.get("Wavelength")]
+    summary = [{"wl": str(x.get("Wavelength")), "loss": _pick(x, "Loss"), "orl": _pick(x, "Orl", "ORL")}
+               for x in (lr.get("Results") or [])]
+    els = []
+    for el in (b.get("Measurement") or {}).get("Elements") or []:
+        res = {}
+        for q in el.get("Results") or []:
+            w = str(q.get("Wavelength") or "")
+            if w:
+                res[w] = {"loss": _pick(q, "Loss"), "refl": _pick(q, "Reflectance"),
+                          "verdict": q.get("Verdict") or q.get("ElementVerdict") or ""}
+                if w not in wls:
+                    wls.append(w)
+        sec = el.get("PreviousFiberSection") or {}
+        sres = {}
+        for q in sec.get("Results") or []:
+            w = str(q.get("Wavelength") or "")
+            if w:
+                sres[w] = {"att": _pick(q, "Attenuation"), "loss": _pick(q, "Loss")}
+        subs = el.get("SubElements") or []
+        els.append({"type": el.get("Type") or (el.get("CustomElementName") or "Element"),
+                    "name": el.get("CustomElementName") or "", "status": el.get("Status") or "",
+                    "verdict": el.get("ElementVerdict") or el.get("Verdict") or "",
+                    "m": _m(el.get("Position")), "res": res, "sub": len(subs),
+                    "subTypes": [str(x.get("Type") or "") for x in subs][:6],
+                    "sec": {"m": _m(sec.get("Length")), "res": sres} if sec else None})
+    els.sort(key=lambda e: (e["m"] is None, e["m"] or 0))
+    for n, e in enumerate(els, 1):
+        e["n"] = n
+    return {"len": _num(lr.get("Length")), "verdict": b.get("GlobalVerdict") or "", "wls": wls,
+            "summary": summary, "elements": els[:120]}
 
 def _one(fms, rid: str, select: str) -> dict | None:
     r = fms.get(fc.RESULTS_URL, params={"$filter": f"resultid eq {rid}", "$top": "1", "$skip": "0", "$select": select})
@@ -276,7 +396,7 @@ def _read_any(fms, rid: str) -> dict:
     md = head.get("metadata") or {}
     if str(md.get("TestType") or "").upper() != "IOLM":
         return {**_read(fms, rid, time.time()), "kind": "OTDR"}
-    full = _one(fms, rid, "resultid,metadata,brief/LinkResults,brief/Measurement/Elements") or head
+    full = _one(fms, rid, "resultid,metadata,brief/GlobalVerdict,brief/LinkResults,brief/Measurement/Elements") or head
     lr = (full.get("brief") or {}).get("LinkResults") or {}
     length = _num(lr.get("Length"))
     events = []
@@ -313,7 +433,8 @@ def _read_any(fms, rid: str) -> dict:
         note = "FMS gave no OTDR trace for this iOLM result, so only its events are shown."
     return {"resultId": rid, "testTime": md.get("TestTime"), "len": length or (best or {}).get("len"),
             "trace": (best or {}).get("trace"), "events": events[:60], "kind": "iOLM", "note": note,
-            "traceOf": (best or {}).get("resultId", "")}
+            "traceOf": (best or {}).get("resultId", ""), "link": link_view(full),
+            "traceEvents": (best or {}).get("events") or [], "wl": (best or {}).get("wl") or ""}
 
 
 def _take(s: dict, shot: dict):
@@ -582,7 +703,7 @@ def make_router(valid_token, check_key, sessions: dict) -> APIRouter:
             t = await asyncio.to_thread(go)
         except RuntimeError as e:
             raise HTTPException(502, str(e)[:200]) from None
-        TRACES[t["resultId"]] = {k: t.get(k) for k in ("resultId", "testTime", "len", "trace", "events", "kind", "note", "traceOf")}
+        TRACES[t["resultId"]] = {k: t.get(k) for k in ("resultId", "testTime", "len", "trace", "events", "kind", "note", "traceOf", "link", "traceEvents", "wl")}
         if len(TRACES) > 60:
             TRACES.pop(next(iter(TRACES)))
         return {**TRACES[t["resultId"]], "secs": t["secs"], "rtu": end["rtu"], "rtuId": end["rtuId"], "seconds": body.seconds,
@@ -605,7 +726,7 @@ def make_router(valid_token, check_key, sessions: dict) -> APIRouter:
                 raise HTTPException(502, str(e)[:160]) from None
             if len(TRACES) > 60:
                 TRACES.pop(next(iter(TRACES)))
-            TRACES[rid] = {k: t.get(k) for k in ("resultId", "testTime", "len", "trace", "events", "kind", "note", "traceOf")}
+            TRACES[rid] = {k: t.get(k) for k in ("resultId", "testTime", "len", "trace", "events", "kind", "note", "traceOf", "link", "traceEvents", "wl")}
         return TRACES[rid]
 
     @router.post("/api/otdr/live/settings")
