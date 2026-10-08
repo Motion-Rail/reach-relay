@@ -59,6 +59,14 @@ CLIENT_ID = "fg-topologyui"
 OTDR_MODE = os.environ.get("OTDR_MODE", "adhoc").strip().lower()
 ADHOC_URL = HOST + "/api/topology/control/remotetestunits/{rtu}/command/opticalroutes/{route}/otdr"
 RESULTS_URL = HOST + "/api/measure/v1/results/"
+# v37 (captured 7 Oct 2026, FMS "Launch Test On Demand" iOLM on SGIC, twice): one iOLM with no Task.
+#   GET  /api/topology/testconfigurations/{setupId}   (the test setup, its payLoad is the full iOLM setup)
+#   POST /api/topology/control/remotetestunits/{rtu}/command/opticalroutes/{route}/iolm
+#        {"name":"iOLM test parameters","payload":"<the setup payLoad as text, MeasurementType set,
+#         OtdrParameters cut to the chosen wavelengths, WavelengthsUsed []>"}
+#   reply: a promise id (GUID), the same as the ad hoc OTDR; the result is stored with metadata.PromiseId.
+IOLM_URL = HOST + "/api/topology/control/remotetestunits/{rtu}/command/opticalroutes/{route}/iolm"
+TESTCONFIG_URL = HOST + "/api/topology/testconfigurations/{id}"
 WS_URL = re.sub(r"^http", "ws", HOST) + "/api/topology/ws/connection"
 ADHOC_TOPIC = "/topic/monitoredassets/{route}/testsetups/adhoc/message/{promise}"
 
@@ -288,9 +296,9 @@ class Fms:
         self._adhoc[pid] = {"route": int(route_id), "watch": watch, "duration": int(duration)}
         return pid
 
-    def adhoc_results(self, route_id: int, top: int = 5) -> list[dict]:
+    def adhoc_results(self, route_id: int, top: int = 5, kind: str = "OTDR") -> list[dict]:
         params = {"$filter": f"metadata/AssetId eq {int(route_id)} and metadata/TestCategory eq 'Adhoc' "
-                             f"and metadata/TestType eq 'OTDR'",
+                             f"and metadata/TestType eq '{kind}'",
                   "$orderby": "metadata/TestTime desc", "$top": str(top), "$skip": "0",
                   "$select": "resultid,brief/LinkResults,metadata"}
         r = self.get(RESULTS_URL, params=params)
@@ -411,6 +419,23 @@ class Outcome:
     seconds: float
     workflow_id: str = ""
     raw: dict = field(default_factory=dict)
+
+
+def iolm_body(cfg: dict, mode: str, wavelengths_nm: list[int]) -> dict:
+    """What the FMS screen posts for an ad hoc iOLM: the stored test setup, with the acquisition mode set and
+    OtdrParameters cut to the chosen wavelengths (WavelengthsUsed stays empty, as FMS sends it)."""
+    raw = cfg.get("payLoad", cfg.get("payload"))
+    p = json.loads(raw) if isinstance(raw, str) else dict(raw or {})
+    if not p:
+        raise RuntimeError("That FMS test setup has no iOLM settings.")
+    want = {round(w * 1e-9, 12) for w in wavelengths_nm}
+    ops = [o for o in (p.get("OtdrParameters") or []) if round(float(o.get("Wavelength") or 0), 12) in want]
+    if not ops:
+        raise RuntimeError("That FMS test setup has none of the chosen wavelengths.")
+    p["OtdrParameters"] = ops
+    p["MeasurementType"] = mode
+    p["WavelengthsUsed"] = []
+    return {"name": "iOLM test parameters", "payload": json.dumps(p, separators=(",", ":"))}
 
 
 def adhoc_payload(duration: int) -> dict:

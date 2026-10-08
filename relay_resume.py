@@ -18,6 +18,7 @@ import os
 import time
 
 MAX_AGE_S = int(os.getenv("RESUME_MAX_AGE_S", str(12 * 3600)))
+KEEP_MAX_AGE_S = int(os.getenv("RESUME_KEEP_MAX_AGE_S", str(30 * 86400)))   # v37: keep me signed in (FMS offline sign in)
 
 
 def _key() -> bytes | None:
@@ -36,7 +37,8 @@ def resume_blob(sid: str, sess: dict | None) -> str:
         return ""
     from cryptography.hazmat.primitives.ciphers.aead import AESGCM
     nonce = os.urandom(12)
-    body = json.dumps({"sid": sid, "user": sess.get("user", ""), "refresh": sess["refresh"], "t": int(time.time())},
+    body = json.dumps({"sid": sid, "user": sess.get("user", ""), "refresh": sess["refresh"], "t": int(time.time()),
+                       "keep": bool(sess.get("keep"))},
                       separators=(",", ":")).encode()
     return base64.urlsafe_b64encode(nonce + AESGCM(k).encrypt(nonce, body, sid.encode())).decode().rstrip("=")
 
@@ -52,6 +54,7 @@ def read_blob(blob: str, sid: str) -> dict | None:
         rec = json.loads(AESGCM(k).decrypt(raw[:12], raw[12:], sid.encode()))
     except Exception:                                   # noqa: BLE001
         return None
-    if rec.get("sid") != sid or not rec.get("refresh") or time.time() - float(rec.get("t", 0)) > MAX_AGE_S:
+    age = KEEP_MAX_AGE_S if rec.get("keep") else MAX_AGE_S
+    if rec.get("sid") != sid or not rec.get("refresh") or time.time() - float(rec.get("t", 0)) > age:
         return None
     return rec

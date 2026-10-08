@@ -51,7 +51,7 @@ MEAS_PAYLOAD_TEMPLATE = os.getenv(
 SETUP_NAME  = os.getenv("SETUP_NAME", "")
 PAGE_SIZE   = int(os.getenv("PAGE_SIZE", "50"))
 
-RELAY_VERSION = "v36"
+RELAY_VERSION = "v37"
 
 # ── relay access ─────────────────────────────────────────────────────────────
 APP_KEY    = os.getenv("APP_KEY", "")
@@ -90,7 +90,7 @@ async def _resume_mw(request, call_next):
         rec = _read_resume(blob, sid)
         if rec:
             try:
-                _store(sid, await _refresh_grant(rec["refresh"]), rec["user"])
+                _store(sid, await _refresh_grant(rec["refresh"]), rec["user"], keep=bool(rec.get("keep")))
                 RESUMED["n"] += 1
             except Exception:                           # noqa: BLE001
                 RESUMED["failed"] += 1
@@ -126,16 +126,28 @@ def _check_key(x_app_key):
 
 
 # ── auth ──────────────────────────────────────────────────────────────────────
-async def _grant(data):
+async def _grant(data, extra_scope=""):
     data = {"client_id": CLIENT_ID, **data}
     if CLIENT_SECRET: data["client_secret"] = CLIENT_SECRET
-    if SCOPE:         data["scope"] = SCOPE
+    scope = " ".join(x for x in (SCOPE, extra_scope) if x)
+    if scope:         data["scope"] = scope
     async with httpx.AsyncClient(timeout=20) as c:
         r = await c.post(AUTH_BASE.rstrip("/") + TOKEN_PATH, data=data,
                          headers={"Content-Type": "application/x-www-form-urlencoded"})
     return r
 
-async def _password_grant(username, password):
+async def _password_grant(username, password, keep=False):
+    """v37: with keep, ask FMS (Keycloak) for an offline sign in, which outlives the normal FMS session idle
+    and maximum times. If FMS does not allow it for this client, sign in the normal way. The password is only
+    passed on to FMS, never kept."""
+    if keep:
+        r = await _grant({"grant_type": "password", "username": username, "password": password}, "offline_access")
+        if r.status_code == 200:
+            tok = r.json()
+            tok["_keep"] = "offline_access" in str(tok.get("scope") or "")
+            return tok
+        if r.status_code == 401 or "invalid_grant" in r.text:
+            raise HTTPException(401, f"EXFO login failed ({r.status_code}): {r.text[:200]}")
     r = await _grant({"grant_type": "password", "username": username, "password": password})
     if r.status_code != 200:
         raise HTTPException(401, f"EXFO login failed ({r.status_code}): {r.text[:200]}")
@@ -147,10 +159,12 @@ async def _refresh_grant(refresh_token):
         raise HTTPException(401, "Session expired — sign in again")
     return r.json()
 
-def _store(sid, tok, user):
+def _store(sid, tok, user, keep=None):
     ttl = int(tok.get("expires_in", TOKEN_TTL_FALLBACK))
+    if keep is None:                                    # a refresh keeps the session's keep signed in choice
+        keep = bool((SESSIONS.get(sid) or {}).get("keep"))
     SESSIONS[sid] = {"access": tok["access_token"], "refresh": tok.get("refresh_token", ""),
-                     "exp": time.time() + ttl - min(150, ttl // 2), "user": user}
+                     "exp": time.time() + ttl - min(150, ttl // 2), "user": user, "keep": bool(keep)}
 
 async def _valid_token(sid):
     s = SESSIONS.get(sid)
@@ -257,6 +271,7 @@ async def _resolve_route_id(token, fibre, rtu_id):
 class LoginIn(BaseModel):
     username: str
     password: str
+    keep: bool = False            # v37: keep me signed in on this device
 
 class PrimeIn(BaseModel):
     search: str
@@ -291,10 +306,27 @@ async def health():
 @app.post("/api/login")
 async def login(body: LoginIn, x_app_key: str | None = Header(default=None)):
     _check_key(x_app_key)
-    tok = await _password_grant(body.username, body.password)
+    tok = await _password_grant(body.username, body.password, keep=body.keep)
     sid = uuid.uuid4().hex
-    _store(sid, tok, body.username)
-    return {"session_id": sid, "user": body.username, "resume": _resume_blob(sid, SESSIONS.get(sid))}
+    keep = bool(tok.pop("_keep", False))
+    _store(sid, tok, body.username, keep=keep)
+    return {"session_id": sid, "user": body.username, "resume": _resume_blob(sid, SESSIONS.get(sid)), "keep": keep}
+
+@app.post("/api/logout")
+async def logout(x_app_key: str | None = Header(default=None), x_session: str | None = Header(default=None)):
+    """v37: sign out ends the FMS sign in too (matters for a keep me signed in offline sign in)."""
+    _check_key(x_app_key)
+    s = SESSIONS.pop(x_session or "", None)
+    if s and s.get("refresh"):
+        data = {"client_id": CLIENT_ID, "refresh_token": s["refresh"]}
+        if CLIENT_SECRET: data["client_secret"] = CLIENT_SECRET
+        try:
+            async with httpx.AsyncClient(timeout=10) as c:
+                await c.post(AUTH_BASE.rstrip("/") + TOKEN_PATH.rsplit("/", 1)[0] + "/logout", data=data,
+                             headers={"Content-Type": "application/x-www-form-urlencoded"})
+        except Exception:                               # noqa: BLE001
+            pass
+    return {"ok": True}
 
 @app.post("/api/routes")
 async def routes(body: PrimeIn, x_app_key: str | None = Header(default=None),

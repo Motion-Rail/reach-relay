@@ -154,11 +154,34 @@ def _fire(fms, s: dict) -> dict:
     return {"pid": pid, "t0": t0}
 
 
-def _await(fms, s: dict, shot: dict) -> str:
+def _fire_iolm(fms, s: dict, setup_id: int, mode: str, wls: list[int]) -> dict:
+    """v37: start one ad hoc iOLM the way the FMS screen does (no Task). Returns {pid, t0}."""
+    r = fms.get(fc.TESTCONFIG_URL.format(id=int(setup_id)))
+    if not r.ok:
+        raise RuntimeError(f"FMS would not give that iOLM test setup ({r.status_code}).")
+    body = fc.iolm_body(r.json(), mode, wls)
+    t0 = time.time()
+    r = fms.post(fc.IOLM_URL.format(rtu=int(s["rtuId"]), route=int(s["routeId"])), json=body)
+    if r.status_code == 409 or "AlreadyScheduled" in r.text:
+        raise RuntimeError("The RTU is busy with another test. Try again when it is free.")
+    if not r.ok:
+        raise RuntimeError(f"FMS refused the iOLM ({r.status_code}): {r.text[:160]}")
+    pid = r.text.strip().strip('"')
+    w = s.get("_watch")
+    if w:
+        try:
+            w.subscribe(fc.ADHOC_TOPIC.format(route=int(s["routeId"]), promise=pid))
+        except Exception:                               # noqa: BLE001
+            s["_watch"] = None
+    return {"pid": pid, "t0": t0}
+
+
+def _await(fms, s: dict, shot: dict, kind: str = "OTDR", limit: float = 90) -> str:
     """Wait for that OTDR's stored result id: the push says it at once; the results list is checked every second too."""
     pid, t0 = shot["pid"], shot["t0"]
     nxt = t0 + max(1.0, int(s.get("shotS") or SHOT_S) - 0.5)   # nothing can be ready before the shot ends
-    while time.time() - t0 < 90 and s["state"] == "running":
+    what = "iOLM" if kind == "iOLM" else "OTDR"
+    while time.time() - t0 < limit and s["state"] == "running":
         w = s.get("_watch")
         if w:
             msg = w.next_message(timeout=0.5)
@@ -166,8 +189,8 @@ def _await(fms, s: dict, shot: dict) -> str:
                 if msg.get("isError") or msg.get("error"):
                     why = msg.get("body") if isinstance(msg.get("body"), str) else str(msg.get("body") or "")
                     if fc.LIVE_PATTERNS.search(why or ""):
-                        raise RuntimeError("Live light on the fibre: the RTU will not fire an OTDR into it.")
-                    raise RuntimeError("The OTDR failed: " + (why[:160] or "no reason given"))
+                        raise RuntimeError(f"Live light on the fibre: the RTU will not fire an {what} into it.")
+                    raise RuntimeError(f"The {what} failed: " + (why[:160] or "no reason given"))
                 if msg.get("lastTestResultId"):
                     s["pushOk"] = True
                     return str(msg["lastTestResultId"])
@@ -175,18 +198,18 @@ def _await(fms, s: dict, shot: dict) -> str:
             time.sleep(0.3)
         if time.time() >= nxt:
             nxt = time.time() + POLL_S
-            for res in fms.adhoc_results(int(s["routeId"]), top=3):
+            for res in fms.adhoc_results(int(s["routeId"]), top=3, kind=kind):
                 md = res.get("metadata") or {}
                 if md.get("PromiseId") == pid:
                     if md.get("HasError"):
                         why = " ".join(fc._strings(res, keys=("message", "messageKey", "error", "errorMessage")))[:200]
                         if fc.LIVE_PATTERNS.search(why):
-                            raise RuntimeError("Live light on the fibre: the RTU will not fire an OTDR into it.")
-                        raise RuntimeError("The OTDR failed: " + (why or "no reason given"))
+                            raise RuntimeError(f"Live light on the fibre: the RTU will not fire an {what} into it.")
+                        raise RuntimeError(f"The {what} failed: " + (why or "no reason given"))
                     return str(res.get("resultid"))
     if s["state"] != "running":
         return ""
-    raise RuntimeError("No result after 90 s. Light on the fibre (a tone or traffic) stops an OTDR.")
+    raise RuntimeError(f"No result after {int(limit)} s. Light on the fibre (a tone or traffic) stops an {what}.")
 
 
 def _read(fms, rid: str, t0: float) -> dict:
@@ -383,9 +406,15 @@ class OnceIn(BaseModel):
     fibre: int
     rtuId: str
     seconds: int = 10
+    kind: str = "otdr"            # v37: "otdr" or "iolm"
+    setupId: int = 28898          # iOLM test setup (28898 = iOLM Motion NRS-304, 1 = AdHoc iOLM)
+    mode: str = "standard"        # iOLM acquisition: standard, fast, rtu
+    wavelengths: list[int] = [1550]
 
 
 ONCE_CHOICES = (5, 10, 15, 30, 60)
+IOLM_WLS = (1310, 1550, 1625)
+IOLM_WAIT_S = 300                     # one fibre, Standard iOLM: 25 to 75 s seen; three wavelengths take longer
 
 
 TRACES: dict[str, dict] = {}          # result id -> reduced trace (stored results never change)
@@ -503,8 +532,20 @@ def make_router(valid_token, check_key, sessions: dict) -> APIRouter:
         stem = body.stem.strip().upper()
         if not 1 <= body.fibre <= 432:
             raise HTTPException(400, "Fibre must be 1 to 432")
-        if body.seconds not in ONCE_CHOICES:
+        kind = (body.kind or "otdr").lower()
+        if kind not in ("otdr", "iolm"):
+            raise HTTPException(400, "Test must be otdr or iolm")
+        if kind == "otdr" and body.seconds not in ONCE_CHOICES:
             raise HTTPException(400, "OTDR length must be one of " + ", ".join(map(str, ONCE_CHOICES)) + " s")
+        if kind == "iolm":
+            from relay_bulk import IOLM_MODES
+            wls = sorted(set(body.wavelengths or []))
+            if not wls or any(w not in IOLM_WLS for w in wls):
+                raise HTTPException(400, "iOLM wavelengths must be from 1310, 1550, 1625")
+            if body.mode not in IOLM_MODES:
+                raise HTTPException(400, "iOLM mode must be standard, fast or rtu")
+            if body.setupId <= 0:
+                raise HTTPException(400, "That is not a test setup")
         import relay_fibres
         import relay_bulk
         ends = await relay_fibres.ensure_ends(token, stem)
@@ -519,22 +560,33 @@ def make_router(valid_token, check_key, sessions: dict) -> APIRouter:
         fms = relay_bulk.FMS_FOR(token) if relay_bulk.FMS_FOR else fc.Fms(token)
 
         def go():
+            if kind == "iolm":
+                from relay_bulk import IOLM_MODES
+                s["shotS"] = 20                         # nothing is stored sooner than this
+                relay_bulk.mark_toning(s["rtuId"], IOLM_WAIT_S + 30, user, s["fibreName"])
+                try:
+                    shot = _fire_iolm(fms, s, body.setupId, IOLM_MODES[body.mode], wls)
+                    rid = _await(fms, s, shot, kind="iOLM", limit=IOLM_WAIT_S)
+                    t = _read_any(fms, rid)
+                    return {**t, "secs": time.time() - shot["t0"]}
+                finally:
+                    relay_bulk.TONING.pop(str(s["rtuId"]), None)
             relay_bulk.mark_toning(s["rtuId"], body.seconds + 60, user, s["fibreName"])
             try:
                 shot = _fire(fms, s)
                 rid = _await(fms, s, shot)
-                return _read(fms, rid, shot["t0"])
+                return {**_read(fms, rid, shot["t0"]), "kind": "OTDR"}
             finally:
                 relay_bulk.TONING.pop(str(s["rtuId"]), None)
         try:
             t = await asyncio.to_thread(go)
         except RuntimeError as e:
             raise HTTPException(502, str(e)[:200]) from None
-        TRACES[t["resultId"]] = {k: t[k] for k in ("resultId", "testTime", "len", "trace", "events")}
+        TRACES[t["resultId"]] = {k: t.get(k) for k in ("resultId", "testTime", "len", "trace", "events", "kind", "note", "traceOf")}
         if len(TRACES) > 60:
             TRACES.pop(next(iter(TRACES)))
         return {**TRACES[t["resultId"]], "secs": t["secs"], "rtu": end["rtu"], "rtuId": end["rtuId"], "seconds": body.seconds,
-                "by": owner, "t": time.time()}
+                "wavelengths": wls if kind == "iolm" else [1550], "by": owner, "t": time.time()}
 
     @router.post("/api/otdr/trace")
     async def trace(body: TraceIn, x_app_key: str | None = Header(default=None), x_session: str | None = Header(default=None)):
