@@ -437,6 +437,36 @@ def _read_any(fms, rid: str) -> dict:
             "traceEvents": (best or {}).get("events") or [], "wl": (best or {}).get("wl") or ""}
 
 
+
+def _loss_of(t: dict):
+    """Link loss for the history line: the iOLM link summary at 1550 if there is one, else the OTDR's last cumulative figure."""
+    lk = t.get("link") or {}
+    for x in lk.get("summary") or []:
+        if str(x.get("wl")) == "1550" and x.get("loss") is not None:
+            return x["loss"]
+    ev = t.get("events") or []
+    return ev[-1].get("cum") if ev and isinstance(ev[-1], dict) else None
+
+
+def _log_single(rec: dict):
+    """v39: a Single Test goes into Run history (runs/<day>/..._SINGLE_<id>.json). Best effort, never stops the test."""
+    try:
+        import relay_continuity as rc
+        if not (rc.LOG_REPO and rc.LOG_TOKEN):
+            return
+        day = time.strftime("%Y-%m-%d", time.gmtime(rec["started"]))
+        rid = uuid.uuid4().hex[:8]
+        path = f"runs/{day}/{day}_{time.strftime('%H%M', time.gmtime(rec['started']))}_{rec['stem']}_SINGLE_F{int(rec['fibre']):03d}_{rid}.json"
+        rc._push_log_sync(path, {**rec, "id": rid}, None, f"single test: {rec['stem']} F{int(rec['fibre']):03d}")
+        try:
+            import relay_team
+            for k in [k for k in relay_team._DIR_CACHE if k.startswith("runs")]:
+                relay_team._DIR_CACHE.pop(k, None)
+        except Exception:                               # noqa: BLE001
+            pass
+    except Exception:                                   # noqa: BLE001
+        pass
+
 def _take(s: dict, shot: dict):
     if s["ref"] is None:
         s["ref"] = shot
@@ -460,7 +490,7 @@ def _loop(s: dict, token_fn):
             if time.time() > s["until"]:
                 s.update(state="done", note="Stopped after the time limit.")
                 break
-            relay_bulk.mark_toning(s["rtuId"], int(s.get("shotS") or SHOT_S) + 30, s["user"], s["fibreName"])
+            relay_bulk.mark_toning(s["rtuId"], int(s.get("shotS") or SHOT_S) + 30, s["user"], s["fibreName"], "realtime", f"{int(s.get('shotS') or SHOT_S)} s traces")
             if pending is None:
                 pending = _fire(fms, s)
             rid = _await(fms, s, pending)
@@ -684,7 +714,7 @@ def make_router(valid_token, check_key, sessions: dict) -> APIRouter:
             if kind == "iolm":
                 from relay_bulk import IOLM_MODES
                 s["shotS"] = 20                         # nothing is stored sooner than this
-                relay_bulk.mark_toning(s["rtuId"], IOLM_WAIT_S + 30, user, s["fibreName"])
+                relay_bulk.mark_toning(s["rtuId"], IOLM_WAIT_S + 30, user, s["fibreName"], "single", "iOLM " + ", ".join(map(str, wls)))
                 try:
                     shot = _fire_iolm(fms, s, body.setupId, IOLM_MODES[body.mode], wls)
                     rid = _await(fms, s, shot, kind="iOLM", limit=IOLM_WAIT_S)
@@ -692,17 +722,24 @@ def make_router(valid_token, check_key, sessions: dict) -> APIRouter:
                     return {**t, "secs": time.time() - shot["t0"]}
                 finally:
                     relay_bulk.TONING.pop(str(s["rtuId"]), None)
-            relay_bulk.mark_toning(s["rtuId"], body.seconds + 60, user, s["fibreName"])
+            relay_bulk.mark_toning(s["rtuId"], body.seconds + 60, user, s["fibreName"], "single", f"OTDR {body.seconds} s")
             try:
                 shot = _fire(fms, s)
                 rid = _await(fms, s, shot)
                 return {**_read(fms, rid, shot["t0"]), "kind": "OTDR"}
             finally:
                 relay_bulk.TONING.pop(str(s["rtuId"]), None)
+        t0 = time.time()
+        rec = {"kind": "single", "test": "iOLM" if kind == "iolm" else "OTDR", "stem": stem, "fibre": body.fibre,
+               "rtu": end["rtu"], "rtuId": end["rtuId"], "user": user, "started": t0,
+               "settings": {"seconds": body.seconds} if kind == "otdr" else {"setupId": body.setupId, "mode": body.mode, "wavelengths": wls}}
         try:
             t = await asyncio.to_thread(go)
         except RuntimeError as e:
+            asyncio.get_event_loop().run_in_executor(None, _log_single, {**rec, "ended": time.time(), "ok": False, "error": str(e)[:200]})
             raise HTTPException(502, str(e)[:200]) from None
+        asyncio.get_event_loop().run_in_executor(None, _log_single, {**rec, "ended": time.time(), "ok": True, "resultId": t.get("resultId"),
+                                                                     "len": t.get("len"), "loss": _loss_of(t)})
         TRACES[t["resultId"]] = {k: t.get(k) for k in ("resultId", "testTime", "len", "trace", "events", "kind", "note", "traceOf", "link", "traceEvents", "wl")}
         if len(TRACES) > 60:
             TRACES.pop(next(iter(TRACES)))

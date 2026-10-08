@@ -56,6 +56,10 @@ SEARCH = (fc.WF_BASE + "/workflow/search?start=0&size={size}&sort=startTime:DESC
           "&query=workflowType%20IN%20(" + fc.WF_NAME + ")%20AND%20status%20IN%20({status})")
 
 
+class RunIn(BaseModel):
+    path: str
+
+
 class PresenceIn(BaseModel):
     screen: str = ""          # mode | uni | e2e | history | login
     cable: str = ""
@@ -346,6 +350,17 @@ def make_router(valid_token, check_key, sessions: dict, rtu_index: dict, relay_v
 
     # ── history ──────────────────────────────────────────────────────────────
     def log_row(rep: dict, path: str) -> dict | None:
+        if rep.get("kind") == "single":                 # v39: a Single Test from the desktop
+            st = rep.get("settings") or {}
+            setting = f"{st.get('seconds')} s" if rep.get("test") == "OTDR" else (", ".join(map(str, st.get("wavelengths") or [])) + " nm")
+            ln, ls = rep.get("len"), rep.get("loss")
+            summ = (f"{rep.get('test')} {setting} on F{int(rep.get('fibre') or 0):03d}: "
+                    + ((f"{float(ln) / 1000:.3f} km" if ln else "length not read") + (f", {float(ls):.2f} dB" if ls is not None else "") if rep.get("ok") else ("failed: " + (rep.get("error") or ""))))
+            return {"source": "log", "id": rep.get("id", ""), "type": "Single Test", "owner": _owner(rep.get("user", "")), "ownerRaw": rep.get("user", ""),
+                    "rtu": _node(rep.get("rtu", "")), "cable": re.sub(r"-R\d+$", "", rep.get("stem", "")),
+                    "scope": f"F{int(rep.get('fibre') or 0):03d}", "result": "Pass" if rep.get("ok") else "Failed", "summary": summ,
+                    "started": rep.get("started"), "ended": rep.get("ended"), "path": path, "resultId": rep.get("resultId", ""),
+                    "fibre": rep.get("fibre"), "stem": rep.get("stem", "")}
         if rep.get("kind") == "uni":
             dis, cross = rep.get("dis") or [], rep.get("cross") or []
             part = rep.get("confirmed", 0) + len(dis) + len(cross) < rep.get("inScope", 0)
@@ -486,6 +501,33 @@ def make_router(valid_token, check_key, sessions: dict, rtu_index: dict, relay_v
         rows = sorted(logs + tasks, key=lambda r: r.get("started") or 0, reverse=True)
         rows = [{**r, "owner": USER_NAMES.get(str(r.get("ownerRaw") or "").lower(), r.get("owner", ""))} for r in rows]
         return {"ok": True, "rows": rows, "notes": [n for n in (note1, note2) if n], "days": days}
+
+    @router.post("/api/history/run")
+    async def history_run(body: RunIn, x_app_key: str | None = Header(default=None),
+                          x_session: str | None = Header(default=None)):
+        """v39: one E2E run's full results for the report in Run history (fibre by fibre)."""
+        check_key(x_app_key)
+        await valid_token(x_session)
+        path = body.path.strip()
+        if not re.fullmatch(r"runs/\d{4}-\d\d-\d\d/[A-Za-z0-9_.\-]+\.json", path):
+            raise HTTPException(400, "That is not a run log")
+        if not (LOG_REPO and LOG_TOKEN):
+            raise HTTPException(409, "Run logs are off on the relay")
+        rep, _ = await asyncio.to_thread(_gh_get_sync, path)
+        if not rep or not rep.get("stem"):
+            raise HTTPException(404, "That run was not found")
+        res = {}
+        for k, v in (rep.get("results") or {}).items():
+            try:
+                res[str(int(k))] = {"state": v.get("state", ""), "found": v.get("found"), "loc": v.get("location") or v.get("loc") or ""}
+            except Exception:                           # noqa: BLE001
+                continue
+        return {"stem": rep.get("stem"), "ribbons": rep.get("ribbons") or [], "results": res, "counts": rep.get("counts") or {},
+                "targets": rep.get("targets"), "tests": rep.get("tests"), "state": rep.get("state", ""),
+                "toneRtu": rep.get("toneRtu", ""), "testRtu": rep.get("testRtu", ""), "started": rep.get("started"),
+                "ended": rep.get("ended"), "user": _owner(rep.get("user") or (rep.get("settings") or {}).get("user", "")),
+                "findings": [x if isinstance(x, str) else (x.get("text") or "") for x in (rep.get("findings") or [])][:20],
+                "settings": {k: (rep.get("settings") or {}).get(k) for k in ("toneS", "otdrS", "wavelengthNm", "freqHz") if (rep.get("settings") or {}).get(k) is not None}}
 
     @router.post("/api/history/add")
     async def history_add(body: UniIn, x_app_key: str | None = Header(default=None),

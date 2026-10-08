@@ -31,6 +31,7 @@ import asyncio
 import os
 import re
 import time
+import uuid
 
 from fastapi import APIRouter, Header, HTTPException
 from pydantic import BaseModel
@@ -95,9 +96,12 @@ TASK_DETAIL = None
 TONING: dict[str, dict] = {}          # rtuId -> {"until": epoch, "user": name, "fibre": str}
 
 
-def mark_toning(rtu_id, seconds: float, user: str = "", fibre: str = ""):
+def mark_toning(rtu_id, seconds: float, user: str = "", fibre: str = "", kind: str = "tone", detail: str = ""):
+    """An RTU busy with a tone (kind tone), a Single Test (single) or Real Time OTDR (realtime). v39 adds kind and detail."""
     if rtu_id:
-        TONING[str(rtu_id)] = {"until": time.time() + float(seconds or 0) + 2, "user": user, "fibre": fibre}
+        old = TONING.get(str(rtu_id)) or {}
+        TONING[str(rtu_id)] = {"until": time.time() + float(seconds or 0) + 2, "user": user, "fibre": fibre, "kind": kind,
+                               "detail": detail, "since": old.get("since") if old.get("kind") == kind and old.get("fibre") == fibre else time.time()}
 
 
 def toning_now() -> list[dict]:
@@ -149,6 +153,15 @@ class BulkIn(BaseModel):
     otdr: OtdrSettings = OtdrSettings()
     iolm: IolmSettings = IolmSettings()
     comment: str = ""
+    order: str = "asc"                          # v39: asc, or offset (start half the cable away, for the far end of a both ends test)
+    delayMin: int = 0                           # v39: start this many minutes from now (0 = now)
+
+
+class SchedIn(BaseModel):
+    id: str
+
+
+SCHEDULED: dict[str, dict] = {}                 # v39: bulk Tests waiting for their start time (in memory)
 
 
 class TasksIn(BaseModel):
@@ -257,6 +270,9 @@ def make_router(valid_token, check_key, sessions: dict, relay_version: str) -> A
         missing = sorted(set(want) - {r["name"] for r in found})
         if missing:
             raise HTTPException(400, f"Not on {b.rtu}: " + ", ".join(missing[:8]) + (" …" if len(missing) > 8 else ""))
+        if b.order == "offset" and len(found) > 1:      # v39: begin half way round, so two ends never test the same fibre together
+            h = len(found) // 2
+            found = found[h:] + found[:h]
         return found
 
     def rtu_name(fms: fc.Fms, rtu_id) -> str:
@@ -390,7 +406,7 @@ def make_router(valid_token, check_key, sessions: dict, relay_version: str) -> A
         data = await asyncio.to_thread(read_tasks, token, 0)
         return {"ok": True, "now": now, "people": sorted(people.values(), key=lambda p: p["name"].lower()),
                 "runs": runs, "uni": uni, "tasks": data.get("running", []), "toning": toning_now(),
-                "me": me(x_session)}
+                "scheduled": [v for v in SCHEDULED.values() if v["state"] in ("waiting", "starting")], "me": me(x_session)}
 
     @router.post("/api/tasks")
     async def tasks(body: TasksIn, x_app_key: str | None = Header(default=None),
@@ -515,9 +531,70 @@ def make_router(valid_token, check_key, sessions: dict, relay_version: str) -> A
             p.pop("inputs")
             return {**p, "ids": ids}
 
+        if body.order not in ("asc", "offset"):
+            raise HTTPException(400, "order must be asc or offset")
+        if not 0 <= int(body.delayMin or 0) <= 720:
+            raise HTTPException(400, "Delay must be 0 to 720 minutes")
+        if body.delayMin:
+            p = await asyncio.to_thread(plan, token, body, user_fields(x_session))    # check the fibres now, start later
+            p.pop("inputs", None)
+            sid = uuid.uuid4().hex[:10]
+            at = time.time() + int(body.delayMin) * 60
+            who = me(x_session)
+            SCHEDULED[sid] = {"id": sid, "at": at, "rtu": body.rtu, "cable": body.cable, "fibres": len(body.fibres),
+                              "kind": body.kind, "order": body.order, "owner": who.get("name", ""), "comment": body.comment,
+                              "state": "waiting", "note": "", "ids": [], "made": time.time()}
+
+            async def later():
+                await asyncio.sleep(max(0, at - time.time()))
+                job = SCHEDULED.get(sid)
+                if not job or job["state"] != "waiting":
+                    return
+                job["state"] = "starting"
+                try:
+                    tok = await valid_token(x_session)
+                    r = await asyncio.to_thread(run_with, tok)
+                    job.update(state="started", ids=r["ids"], note=f"Started {len(r['ids'])} FMS Task{'s' if len(r['ids']) != 1 else ''}.")
+                    _TASKS["t"] = 0
+                except Exception as e:                  # noqa: BLE001
+                    job.update(state="failed", note=(getattr(e, "detail", None) or str(e))[:200])
+
+            def run_with(tok):
+                p2 = plan(tok, body, user_fields(x_session))
+                fms = fms_for(tok)
+                ids = []
+                for inp in p2["inputs"]:
+                    r = fms.post(fc.WF_BASE + "/workflow", json={"name": fc.WF_NAME, "input": inp})
+                    if not r.ok:
+                        raise HTTPException(502, f"FMS refused the start: {r.status_code} {r.text[:200]}")
+                    ids.append(r.text.strip().strip('"'))
+                return {"ids": ids}
+            asyncio.get_event_loop().create_task(later())
+            for k in [k for k, v in SCHEDULED.items() if v["state"] != "waiting" and time.time() - v["at"] > 6 * 3600]:
+                SCHEDULED.pop(k, None)
+            return {"ok": True, "scheduled": True, "at": at, "sid": sid, "ids": [], **p}
         res = await asyncio.to_thread(run)
         _TASKS["t"] = 0
         return {"ok": True, **res}
+
+    @router.post("/api/bulk/scheduled")
+    async def bulk_scheduled(x_app_key: str | None = Header(default=None), x_session: str | None = Header(default=None)):
+        check_key(x_app_key)
+        await valid_token(x_session)
+        return {"ok": True, "now": time.time(), "items": sorted(SCHEDULED.values(), key=lambda v: v["at"])}
+
+    @router.post("/api/bulk/unschedule")
+    async def bulk_unschedule(body: SchedIn, x_app_key: str | None = Header(default=None), x_session: str | None = Header(default=None)):
+        check_key(x_app_key)
+        await valid_token(x_session)
+        require_desktop(sessions, x_session)
+        j = SCHEDULED.get(body.id)
+        if not j:
+            raise HTTPException(404, "That scheduled test was not found")
+        if j["state"] != "waiting":
+            raise HTTPException(409, "It has already " + ("started" if j["state"] == "started" else j["state"]))
+        j.update(state="cancelled", note="Cancelled before it started by " + me(x_session).get("name", ""))
+        return {"ok": True}
 
     @router.post("/api/desktop/access")
     async def desktop_access(x_app_key: str | None = Header(default=None),
