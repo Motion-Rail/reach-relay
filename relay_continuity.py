@@ -68,7 +68,7 @@ PACE = {                              # measured on RGAC2 -> SNBC, 28 Sep 2026
     "outage_wait_s": 60,              # v22: FMS not answering: wait, then retry the same test
     "outage_limit_s": 7200,           #      give up (run fails, resumable) after 2 h                # v20: acquisition must start at least this long before the tone ends              # v18: a dark result later than tone start + tone + this is rechecked
 }
-RELAY_VERSION = "Brunel"   # kept in step with main.py
+RELAY_VERSION = "Brunel.1"   # kept in step with main.py
 JOBS: dict[str, dict] = {}
 LOCKS: dict[str, asyncio.Lock] = {}
 ROUTES: dict[str, dict[str, dict]] = {}          # rtuName -> {routeName: node}
@@ -628,10 +628,12 @@ def make_router(valid_token, check_key, tone, live_tone: bool) -> APIRouter:
                         return False
                     n = len(job["testLog"])
                     eng.tests += 1
+                    g0 = time.time()
                     v = await test(f, f)
+                    goS = round(time.time() - g0, 1)       # Brunel.1: the whole go, rechecks included
                     log = job["testLog"][n:] if len(job["testLog"]) > n else [{}]
                     last = log[-1]
-                    row.append({"v": v, "cycleS": last.get("cycleS"), "otdrS": last.get("otdrS"),
+                    row.append({"v": v, "cycleS": goS, "otdrS": last.get("otdrS"),
                                 "late": any(x.get("verdict") == "late" for x in log)})
                 hits = [i for i, x in enumerate(row) if x["v"] == "clash"]
                 eng.say(f"  {ce.fname(f)}: lit on {len(hits)} of {len(row)} goes"
