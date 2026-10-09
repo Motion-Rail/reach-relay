@@ -246,13 +246,25 @@ def make_router(valid_token, check_key, sessions: dict, rtu_index: dict, relay_v
                 "owner": _owner(inp.get("creatorName") or inp.get("UserName") or ""),
                 "rtu": rtu_name(fms, first.get("RtuId")), "rtuId": str(first.get("RtuId") or ""),
                 "cable": re.sub(r"-R\d+$", "", _cable(names[0])) if names else "",
-                "scope": scope, "result": result,
+                "scope": scope, "result": result, "ribbons": _rib_spec(nums), "kind": kind,
                 "summary": (f"{n} fibres, still running" if status == "RUNNING" else
                             f"Cancelled after {ok} of {n}" if status == "TERMINATED" else
                             f"{ok} of {n} completed" + (f", {failed} failed" if failed else ""))
                            + (f". {setting}" if setting else "") + (f". {inp.get('comment')}" if inp.get("comment") else ""),
                 "started": (wf.get("startTime") or 0) / 1000, "ended": (wf.get("endTime") or 0) / 1000 or None,
                 "status": status}
+
+    def _rib_spec(nums) -> str:
+        """Brunel.3: the ribbons a Task covered, as 1-2,5 (for its report)."""
+        rs = sorted({(f - 1) // 12 + 1 for f in nums or []})
+        out, i = [], 0
+        while i < len(rs):
+            k = i
+            while k + 1 < len(rs) and rs[k + 1] == rs[k] + 1:
+                k += 1
+            out.append(f"{rs[i]}" if i == k else f"{rs[i]}-{rs[k]}")
+            i = k + 1
+        return ",".join(out)
 
     def fms_running(token: str) -> list[dict]:
         if time.time() - _FMS_RUNNING["t"] < 30:

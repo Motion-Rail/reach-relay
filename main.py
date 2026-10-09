@@ -54,8 +54,8 @@ PAGE_SIZE   = int(os.getenv("PAGE_SIZE", "50"))
 # Brunel (9 Oct 2026): releases are named after great railway engineers, in this order:
 # Brunel, Stephenson, Telford, Gresley, Locke, Fowler, Hackworth, Trevithick, Churchward, Stanier.
 # A minor update adds .1, .2 (Brunel.1). RELAY_BUILD keeps counting up for checks.
-RELAY_VERSION = "Brunel.2"
-RELAY_BUILD = 42
+RELAY_VERSION = "Brunel.3"
+RELAY_BUILD = 43
 
 # ── relay access ─────────────────────────────────────────────────────────────
 APP_KEY    = os.getenv("APP_KEY", "")
@@ -511,3 +511,7 @@ app.include_router(_files_router(_valid_token, _check_key, SESSIONS))
 # ── v36: cable report as an Excel workbook (see relay_report.py) ──
 from relay_report import make_router as _report_router
 app.include_router(_report_router(_valid_token, _check_key, SESSIONS))
+
+# ── Brunel.3: the full FMS Test Results Report (the PC tool's engine) from the app (see relay_fullreport.py) ──
+from relay_fullreport import make_router as _fullreport_router
+app.include_router(_fullreport_router(_valid_token, _check_key, SESSIONS))

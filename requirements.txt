@@ -6,3 +6,4 @@ requests==2.32.3
 websockets==13.1
 cryptography>=42
 openpyxl>=3.1
+pillow>=10.4
