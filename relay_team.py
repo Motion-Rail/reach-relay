@@ -56,6 +56,26 @@ SEARCH = (fc.WF_BASE + "/workflow/search?start=0&size={size}&sort=startTime:DESC
           "&query=workflowType%20IN%20(" + fc.WF_NAME + ")%20AND%20status%20IN%20({status})")
 
 
+
+def mirror_flips(results: dict) -> set[str]:
+    """Fibres crossed to their mirror (F1 to F12) in a ribbon where at least two mirror pairs agree:
+    the same rule as Cable View and the Excel report. Used to read runs saved before Brunel.4 as flipped."""
+    by_rib: dict[int, set] = {}
+    hits: dict[int, list] = {}
+    for k, v in (results or {}).items():
+        try:
+            f, g = int(k), int(v.get("found") or 0)
+        except Exception:                               # noqa: BLE001
+            continue
+        if v.get("state") != "cross" or not g or (g - 1) // 12 != (f - 1) // 12:
+            continue
+        p, q = (f - 1) % 12 + 1, (g - 1) % 12 + 1
+        if q == 13 - p:
+            r = (f - 1) // 12 + 1
+            by_rib.setdefault(r, set()).add(min(p, q))
+            hits.setdefault(r, []).append(k)
+    return {k for r, ks in hits.items() if len(by_rib[r]) >= 2 for k in ks}
+
 class RunIn(BaseModel):
     path: str
 
@@ -391,16 +411,27 @@ def make_router(valid_token, check_key, sessions: dict, rtu_index: dict, relay_v
                     "location": rep.get("location", "")}
         if not rep.get("stem"):
             return None
-        c = rep.get("counts") or {}
+        c = dict(rep.get("counts") or {})
         state = rep.get("state", "")
-        issues = c.get("cross", 0) + c.get("dis", 0) + c.get("unres", 0)
+        res0 = rep.get("results") or {}
+        old_flips = {k for k, v in res0.items() if v.get("state") == "cross" and k in mirror_flips(res0)}
+        if old_flips:                                   # Brunel.4: runs before the flip check, reread the same way
+            res0 = {k: ({**v, "state": "flip"} if k in old_flips else v) for k, v in res0.items()}
+            rep = {**rep, "results": res0}
+            c["cross"] = c.get("cross", 0) - len(old_flips)
+            c["flip"] = c.get("flip", 0) + len(old_flips)
+        issues = c.get("cross", 0) + c.get("flip", 0) + c.get("dis", 0) + c.get("unres", 0)
         result = {"running": "Running", "paused": "Running", "stopped": "Stopped", "error": "Failed",
                   "interrupted": "Stopped", "resumed": "Stopped"}.get(state, "Issues" if issues else "Pass")
-        summ = (f"{c.get('straight', 0)} straight, {c.get('cross', 0)} crossed, {c.get('dis', 0)} DIS"
+        flips = sorted({(int(k) - 1) // 12 + 1 for k, v in (rep.get("results") or {}).items() if v.get("state") == "flip"})
+        summ = (f"{c.get('straight', 0)} straight, " + (f"{c.get('flip', 0)} flipped, " if c.get("flip") else "")
+                + f"{c.get('cross', 0)} crossed, {c.get('dis', 0)} DIS"
                 + (f", {c.get('unres')} not found" if c.get("unres") else "")
                 + f" of {rep.get('targets')}. {rep.get('tests', 0)} tests")
         crosses = [f"F{int(k):03d}→F{int(v.get('found') or 0):03d}" for k, v in (rep.get("results") or {}).items()
                    if v.get("state") == "cross"]
+        if flips:
+            summ += ". Flipped " + ", ".join(f"R{r}" for r in flips)
         if crosses:
             summ += ". Crossed " + ", ".join(crosses[:8]) + ("…" if len(crosses) > 8 else "")
         fb = rep.get("feedback") or {}

@@ -54,8 +54,8 @@ PAGE_SIZE   = int(os.getenv("PAGE_SIZE", "50"))
 # Brunel (9 Oct 2026): releases are named after great railway engineers, in this order:
 # Brunel, Stephenson, Telford, Gresley, Locke, Fowler, Hackworth, Trevithick, Churchward, Stanier.
 # A minor update adds .1, .2 (Brunel.1). RELAY_BUILD keeps counting up for checks.
-RELAY_VERSION = "Brunel.3"
-RELAY_BUILD = 43
+RELAY_VERSION = "Brunel.4"
+RELAY_BUILD = 44
 
 # ── relay access ─────────────────────────────────────────────────────────────
 APP_KEY    = os.getenv("APP_KEY", "")

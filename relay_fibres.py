@@ -353,6 +353,7 @@ def build(stem: str, ends: list[dict]) -> dict:
                 if (rows[f].get("e2e") or {}).get("t", 0) <= t:
                     rows[f]["e2e"] = item
                 word = {"straight": "straight", "cross": f"crossed to F{int(v.get('found') or 0):03d}",
+                        "flip": f"flipped ribbon, lands on F{int(v.get('found') or 0):03d}",
                         "dis": "Dis." + (f", {item['loc']}" if item["loc"] else ""), "unres": "not found"}.get(v.get("state"), v.get("state"))
                 note(f, {"t": t, "type": "E2E", "end": rep.get("toneRtu", ""), "summary": word, "by": who})
     for p in list(WF_PARSED.values()):

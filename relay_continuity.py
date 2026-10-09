@@ -69,7 +69,7 @@ PACE = {                              # measured on RGAC2 -> SNBC, 28 Sep 2026
     "outage_wait_s": 60,              # v22: FMS not answering: wait, then retry the same test
     "outage_limit_s": 7200,           #      give up (run fails, resumable) after 2 h                # v20: acquisition must start at least this long before the tone ends              # v18: a dark result later than tone start + tone + this is rechecked
 }
-RELAY_VERSION = "Brunel.3"   # kept in step with main.py
+RELAY_VERSION = "Brunel.4"   # kept in step with main.py
 JOBS: dict[str, dict] = {}
 LOCKS: dict[str, asyncio.Lock] = {}
 ROUTES: dict[str, dict[str, dict]] = {}          # rtuName -> {routeName: node}
@@ -206,6 +206,11 @@ class FeedbackReq(BaseModel):
 
 # v20: every finished run (and any feedback on it) is written to a private GitHub repo, so runs
 # can be reviewed and the search tuned. Off unless both are set on the relay.
+
+def flipped_ribbons(results: dict) -> list[int]:
+    """Brunel.4: ribbons with a fibre marked flipped (the whole ribbon goes 1 to 12, 12 to 1)."""
+    return sorted({(int(k) - 1) // 12 + 1 for k, v in (results or {}).items() if v.get("state") == "flip"})
+
 LOG_REPO = os.environ.get("LOG_REPO", "")            # e.g. Motion-Rail/relay-logs
 LOG_TOKEN = os.environ.get("LOG_TOKEN", "")          # fine grained token, contents read/write on LOG_REPO only
 LOG_API = os.environ.get("LOG_API", "https://api.github.com").rstrip("/")
@@ -412,7 +417,7 @@ def make_router(valid_token, check_key, tone, live_tone: bool) -> APIRouter:
                 f, st = int(k), v.get("state")
             except Exception:                           # noqa: BLE001
                 continue
-            if st in ("straight", "cross", "dis") and f in targets:
+            if st in ("straight", "cross", "flip", "dis") and f in targets:
                 found = int(v.get("found") or 0) if st == "dis" else int(v.get("found") or f)
                 eng.results[f] = ce.Result(st, found, int(v.get("tests") or 0),
                                            (v.get("why") or "").replace(" (earlier run)", "") + " (earlier run)")
@@ -669,6 +674,7 @@ def make_router(valid_token, check_key, tone, live_tone: bool) -> APIRouter:
         res = eng.results
         counts = {"straight": sum(r.state == "straight" for r in res.values()),
                   "cross": sum(r.state == "cross" for r in res.values()),
+                  "flip": sum(r.state == "flip" for r in res.values()),
                   "dis": sum(r.state == "dis" for r in res.values()),
                   "unres": sum(r.state == "unres" for r in res.values())}
         out = {k: job[k] for k in ("id", "state", "simulate", "stem", "toneRtu", "testRtu", "ribbons",
@@ -780,9 +786,13 @@ def make_router(valid_token, check_key, tone, live_tone: bool) -> APIRouter:
         word = {"done": "complete", "stopped": "stopped", "error": "failed"}.get(job["state"], job["state"])
         title = f"E2E {cable} {rib}: {word}"
         mins = round(((job["ended"] or time.time()) - job["started"]) / 60)
-        lines = [f"{c['straight']} straight, {c['cross']} crossed, {c.get('dis', 0)} DIS"
+        flipped = flipped_ribbons(res)
+        lines = [f"{c['straight']} straight, " + (f"{c['flip']} flipped, " if c.get("flip") else "")
+                 + f"{c['cross']} crossed, {c.get('dis', 0)} DIS"
                  + (f", {c['unres']} not found" if c.get("unres") else "")
                  + f" of {job['targets']} fibres. {s['tests']} tests, {mins} min."]
+        if flipped:
+            lines.append("Flipped (1 to 12, 12 to 1): " + ", ".join(f"R{r}" for r in flipped))
         crosses = [f"F{int(k):03d} → F{v['found']:03d}" for k, v in res.items() if v["state"] == "cross"]
         if crosses:
             lines.append("Crossed: " + ", ".join(crosses[:12]) + ("…" if len(crosses) > 12 else ""))

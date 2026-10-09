@@ -89,6 +89,8 @@ class Engine:
     candidate: int = 0
     after_dis: object = None      # v22: async hook(f) run once a fibre is marked DIS (relay measures its length)
     dark_ribbons: list = field(default_factory=list)   # v26: ribbons with no light at all
+    flipped_ribbons: list = field(default_factory=list)  # Brunel.4: ribbons declared flipped (1 to 12)
+    no_flip: set = field(default_factory=set)            # Brunel.4: fibres already shown not to be on their mirror
 
     def say(self, msg: str):
         self.log.append(time.strftime("%H:%M:%S ") + msg)
@@ -228,6 +230,8 @@ class Engine:
             self.say(f"{fname(f)} {rplabel(f)} CROSS to {fname(res.found)} {rplabel(res.found)} ({res.why})")
             if self.opts.learn:
                 self.learn_from(f, res.found)
+        elif res.state == "flip":
+            self.say(f"{fname(f)} {rplabel(f)} FLIPPED, lands on {fname(res.found)} {rplabel(res.found)}")
         elif res.state == "dis":
             self.say(f"{fname(f)} {rplabel(f)} DIS, {res.why} ({res.tests} tests)")
         else:
@@ -271,6 +275,169 @@ class Engine:
             return True
         return False
 
+    # ---- Brunel.4: flipped ribbon (1 to 12, 12 to 1) found early and declared, not tested fibre by fibre ----
+    FLIP_PAIRS = 2          # mirror pairs proven both ways before the whole ribbon is declared flipped
+    FLIP_RANDOM_CHECK = True  # Brunel.4 (Alkis): then one more pair, picked at random from the rest, must agree
+
+    @staticmethod
+    def mirror(f: int) -> int:
+        r, p = rp(f)
+        return gf(r, PER + 1 - p)
+
+    def _declare_flip(self, r: int, fibres: list[int], proven: list[tuple[int, int]], counts: dict):
+        pairs = ", ".join(f"{fname(a)}/{fname(b)}" for a, b in proven)
+        self.say(f"R{r}: FLIPPED. {pairs} proven both ways, the last picked at random (f1 lands on f12, f12 on f1). "
+                 f"Stopping here: the rest of R{r} is declared flipped, not tested one by one.")
+        done = {x for a, b in proven for x in (a, b)}
+        for f in fibres:
+            if f in self.results and self.results[f].state != "cross":
+                continue
+            if f in self.no_flip:                    # already seen dark on its mirror: checked again by the caller
+                continue
+            m = self.mirror(f)
+            if f in done:
+                why = "flipped ribbon, proven"
+            else:
+                why = f"flipped ribbon, declared from {pairs}"
+            res = Result("flip", m, counts.get(f, 0), why)
+            self.used_far.add(m)
+            self.results[f] = res
+        self.flipped_ribbons.append(r)
+        self.hyp = [h for h in self.hyp if not (h.type == "reverse" and h.r == r)]
+
+    async def _flip_leftovers(self, r: int, fibres: list[int], test, control, counts: dict) -> bool:
+        """After a flip is declared: a fibre already seen dark on its mirror gets one more long check, then DIS."""
+        for f in fibres:
+            if f in self.results:
+                continue
+            m = self.mirror(f)
+            self.current = f
+            n0 = self.tests
+            hit = await self._hit(f, m, test, control, tries=2) if m not in self.used_far else False
+            if hit is None:
+                return False
+            counts[f] = counts.get(f, 0) + self.tests - n0
+            if hit:
+                self.used_far.add(m)
+                self.results[f] = Result("flip", m, counts[f], "flipped ribbon, on recheck")
+                self.say(f"{fname(f)} {rplabel(f)} FLIPPED, lands on {fname(m)} on recheck")
+            else:
+                self.record(f, Result("dis", 0, counts[f], f"no light on its own position or its mirror; R{r} flipped"))
+                if self.after_dis:
+                    await self.after_dis(f)
+        return True
+
+    async def _flip_random_check(self, r: int, fibres: list[int], proven: list, test, control, counts: dict):
+        """One more mirror pair, chosen at random from the pairs not yet tested, proven both ways.
+        True if it agrees (added to proven), False if not, None if stopped. True if no pair is left to try."""
+        import random
+        done = {x for a, b in proven for x in (a, b)}
+        cands = [a for a in fibres if a not in done and a not in self.results and a not in self.no_flip
+                 and rp(a)[1] <= PER // 2 and self.mirror(a) not in self.used_far and self.mirror(a) not in done]
+        if not cands:
+            return True
+        a = random.choice(cands)
+        b = self.mirror(a)
+        self.say(f"  random check: {fname(a)} {rplabel(a)} on {fname(b)} and back.")
+        for src, dst in ((a, b), (b, a)):
+            if src not in fibres:
+                continue
+            self.current = src
+            n0 = self.tests
+            hit = await self._hit(src, dst, test, control, tries=2)
+            counts[src] = counts.get(src, 0) + self.tests - n0
+            if hit is None:
+                return None
+            if not hit:
+                self.say(f"  random check failed: {fname(src)} is not on {fname(dst)}.")
+                self.no_flip.add(src)
+                return False
+        proven.append((a, b))
+        self.say(f"  random check agrees: {fname(a)} on {fname(b)} and {fname(b)} on {fname(a)}.")
+        return True
+
+    async def _flip_check(self, r: int, f: int, fibres: list[int], test, control, counts: dict, known: bool = False):
+        """f is dark on its own position and nothing in R{r} is straight yet. Try its mirror (f1 on f12).
+        Returns None if stopped, False if not flipped, ("flip",) once declared, or ("pair", g) when only
+        f and its mirror are swapped (recorded as crosses; the rest of the ribbon carries on as normal)."""
+        m = self.mirror(f)
+        if m == f or (m in self.used_far and not known):
+            return False
+        if not known:
+            self.say(f"R{r}: {fname(f)} is dark on its own position; checking for a flipped ribbon ({fname(f)} on {fname(m)}).")
+            self.current = f
+            n0 = self.tests
+            hit = await self._hit(f, m, test, control, tries=1)
+            counts[f] = counts.get(f, 0) + self.tests - n0
+            if hit is None:
+                return None
+            if not hit:
+                self.say(f"  {fname(f)} is not on {fname(m)}: not a flipped ribbon so far.")
+                return False
+        self.say(f"  {fname(f)} lands on {fname(m)}. Checking the other way and one more pair before calling it a flip.")
+        proven: list[tuple[int, int]] = []
+        order = [f] + [x for x in fibres if x != f and x != m and x not in self.results and x not in self.no_flip]
+        seen: set[int] = set()
+        misses = 0
+        for a in order:
+            if len(proven) >= self.FLIP_PAIRS:
+                break
+            b = self.mirror(a)
+            if a in seen or b in seen or a == b or (b in self.used_far and a != f):
+                continue
+            seen.update((a, b))
+            self.current = a
+            if a != f:                                          # a to its mirror (already done for f)
+                n0 = self.tests
+                hit = await self._hit(a, b, test, control, tries=2)
+                counts[a] = counts.get(a, 0) + self.tests - n0
+                if hit is None:
+                    return None
+                if not hit:                                     # could be one dead fibre in a flipped ribbon
+                    self.no_flip.add(a)
+                    misses += 1
+                    if misses >= 2:
+                        break
+                    continue
+            if b in fibres and b not in self.results:          # and back: its mirror on it
+                self.current = b
+                n0 = self.tests
+                back = await self._hit(b, a, test, control, tries=2)
+                counts[b] = counts.get(b, 0) + self.tests - n0
+                if back is None:
+                    return None
+                if not back:
+                    self.say(f"  {fname(b)} is not on {fname(a)}, so {fname(a)}/{fname(b)} is not a clean swap.")
+                    self.record(a, Result("cross", b, counts[a], f"R{r} reversed"))
+                    break
+            proven.append((a, b))
+            self.say(f"  pair {len(proven)}: {fname(a)} on {fname(b)} and {fname(b)} on {fname(a)}.")
+        if len(proven) >= self.FLIP_PAIRS and self.FLIP_RANDOM_CHECK:
+            ok = await self._flip_random_check(r, fibres, proven, test, control, counts)
+            if ok is None:
+                return None
+            if not ok:
+                self.say(f"R{r}: the random check did not agree, so the ribbon is not declared flipped; "
+                         f"searching the rest fibre by fibre.")
+                for a, b in proven:
+                    if a not in self.results:
+                        self.record(a, Result("cross", b, counts.get(a, 0), f"R{r} reversed"))
+                    if b in fibres and b not in self.results:
+                        self.record(b, Result("cross", a, counts.get(b, 0), f"swapped with {fname(a)}"))
+                return ("pair", m)
+        if len(proven) >= self.FLIP_PAIRS:
+            self._declare_flip(r, fibres, proven, counts)
+            return ("flip",)
+        # not enough to call a flip: keep what was proven as crosses, the rest goes through the pattern
+        for a, b in proven:
+            if a not in self.results:
+                self.record(a, Result("cross", b, counts.get(a, 0), f"R{r} reversed"))
+            if b in fibres and b not in self.results:
+                self.record(b, Result("cross", a, counts.get(b, 0), f"swapped with {fname(a)}"))
+        if f in self.results and self.results[f].state == "cross":
+            return ("pair", m)
+        return False
+
     # ---- v26: whole ribbon dark ----
     EARLY_DARK = 4
 
@@ -287,6 +454,8 @@ class Engine:
                             (r - PERBUNDLE, q, f"bundle crossed with R{r - PERBUNDLE}, reversed")]:
             if 1 <= rr <= RIBBONS:
                 g = gf(rr, pp)
+                if rr == r and pp == q and f in self.no_flip:
+                    continue
                 if g != f and g not in self.used_far:
                     out.append((g, why))
         return out
@@ -353,6 +522,7 @@ class Engine:
         counts: dict[int, int] = {}
         pending: list[int] = []
         probed: set[int] = set()
+        flip_checks = 0
         # 1. straight pass: every fibre on its own position, one retry with a long tone
         for f in fibres:
             if f in self.results:
@@ -374,6 +544,17 @@ class Engine:
             else:
                 pending.append(f)
                 self.say(f"  {fname(f)} {rplabel(f)} dark on its own position, will search after the ribbon")
+                # Brunel.4: the first dark fibre with nothing straight yet: is the ribbon flipped (f1 on f12)?
+                if flip_checks < 2 and not any(self.results.get(x) and self.results[x].state == "straight" for x in fibres):
+                    flip_checks += 1
+                    fl = await self._flip_check(r, f, fibres, test, control, counts)
+                    if fl is None:
+                        return False
+                    if fl == ("flip",):
+                        return await self._flip_leftovers(r, fibres, test, control, counts)
+                    if not fl:
+                        self.no_flip.add(f)
+                    continue                                  # a lone swapped pair: carry on with the straight pass
             # v26: the first fibres of the ribbon all dark: check for a crossed ribbon or bundle straight away
             straight_now = sum(1 for x in fibres if self.results.get(x) and self.results[x].state == "straight")
             if not straight_now and len(pending) == self.EARLY_DARK and not probed:
@@ -386,6 +567,14 @@ class Engine:
                 if found:
                     g, why = found
                     f0 = pending[0]
+                    if g == self.mirror(f0):                   # Brunel.4: reversed, prove it as a flip
+                        fl = await self._flip_check(r, f0, fibres, test, control, counts, known=True)
+                        if fl is None:
+                            return False
+                        if fl == ("flip",):
+                            return await self._flip_leftovers(r, fibres, test, control, counts)
+                        rest = [x for x in fibres if x not in self.results]
+                        return await self._apply_pattern(r, rest, test, control, targets, counts, why)
                     self.record(f0, Result("cross", g, counts[f0], why))
                     if await self._swap_check(f0, g, test, control, targets, counts) is None:
                         return False
@@ -444,6 +633,14 @@ class Engine:
                     return False
                 if found:
                     g, why = found
+                    if g == self.mirror(f):                    # Brunel.4: reversed, prove it as a flip
+                        fl = await self._flip_check(r, f, fibres, test, control, counts, known=True)
+                        if fl is None:
+                            return False
+                        if fl == ("flip",):
+                            return await self._flip_leftovers(r, fibres, test, control, counts)
+                        return await self._apply_pattern(r, [x for x in pending if x not in self.results],
+                                                         test, control, targets, counts, why)
                     self.record(f, Result("cross", g, counts[f], why))
                     if await self._swap_check(f, g, test, control, targets, counts) is None:
                         return False
@@ -550,6 +747,7 @@ class Engine:
             "results": {str(f): {"state": r.state, "found": r.found, "tests": r.tests, "why": r.why}
                         for f, r in sorted(self.results.items())},
             "patterns": [{"label": h.label, "hits": h.hits} for h in self.hyp],
+            "flippedRibbons": list(self.flipped_ribbons),
             "tests": self.tests, "current": self.current, "candidate": self.candidate,
             "log": self.log[-80:],
         }
