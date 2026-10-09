@@ -287,7 +287,9 @@ def make_router(valid_token, check_key, sessions: dict, rtu_index: dict, relay_v
                 continue
             eng = j.get("engine")
             done = len(getattr(eng, "results", {}) or {})
-            out.append({"type": "E2E", "owner": _owner(j.get("user", "")), "cable": re.sub(r"-R\d+$", "", j.get("stem", "")),
+            if j.get("kind") == "speed":
+                done = len(j.get("speed") or {})
+            out.append({"type": "Speed test" if j.get("kind") == "speed" else "E2E", "owner": _owner(j.get("user", "")), "cable": re.sub(r"-R\d+$", "", j.get("stem", "")),
                         "rtu": f"{_node(j.get('toneRtu'))} to {_node(j.get('testRtu'))}",
                         "rtus": [j.get("toneRtu"), j.get("testRtu")], "scope": _ribbon_text(j.get("ribbons")),
                         "progress": f"{done} of {j.get('targets')}", "state": j.get("state"),
@@ -393,7 +395,16 @@ def make_router(valid_token, check_key, sessions: dict, rtu_index: dict, relay_v
         if fb.get("verdict"):
             summ += f". Site check: {fb['verdict']}"
         via = sorted({t.get("via") for t in rep.get("testLog") or [] if t.get("via")})
-        return {"source": "log", "id": rep.get("id", ""), "type": "E2E",
+        sp = rep.get("speed") if rep.get("kind") == "speed" else None
+        if sp:                                              # Brunel: E2E speed test
+            w = sp.get("withinPct") or [0, 0, 0]
+            summ = (f"Speed test, {sp.get('fibres', 0)} fibres: one go finds a fibre {sp.get('oneGoPct')}%, "
+                    f"within 3 goes {w[2] if len(w) > 2 else '?'}%, average go {sp.get('avgGoS')} s")
+            if sp.get("never"):
+                summ += ". Never lit " + ", ".join(f"F{int(f):03d}" for f in sp["never"][:6])
+            if result in ("Pass", "Issues"):
+                result = "Done"
+        return {"source": "log", "id": rep.get("id", ""), "type": "Speed test" if sp else "E2E",
                 "owner": _owner(rep.get("user") or (rep.get("settings") or {}).get("user", "")),
                 "ownerRaw": rep.get("user") or (rep.get("settings") or {}).get("user", ""),
                 "rtu": f"{_node(rep.get('toneRtu'))} to {_node(rep.get('testRtu'))}",
@@ -527,7 +538,8 @@ def make_router(valid_token, check_key, sessions: dict, rtu_index: dict, relay_v
                 "toneRtu": rep.get("toneRtu", ""), "testRtu": rep.get("testRtu", ""), "started": rep.get("started"),
                 "ended": rep.get("ended"), "user": _owner(rep.get("user") or (rep.get("settings") or {}).get("user", "")),
                 "findings": [x if isinstance(x, str) else (x.get("text") or "") for x in (rep.get("findings") or [])][:20],
-                "settings": {k: (rep.get("settings") or {}).get(k) for k in ("toneS", "otdrS", "wavelengthNm", "freqHz") if (rep.get("settings") or {}).get(k) is not None}}
+                "settings": {k: (rep.get("settings") or {}).get(k) for k in ("toneS", "otdrS", "wavelengthNm", "freqHz", "shortTries", "speedTries") if (rep.get("settings") or {}).get(k) is not None},
+                "kind": rep.get("kind", "run"), "speed": rep.get("speed") if rep.get("kind") == "speed" else None}
 
     @router.post("/api/history/add")
     async def history_add(body: UniIn, x_app_key: str | None = Header(default=None),

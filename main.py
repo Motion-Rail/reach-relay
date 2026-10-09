@@ -51,7 +51,11 @@ MEAS_PAYLOAD_TEMPLATE = os.getenv(
 SETUP_NAME  = os.getenv("SETUP_NAME", "")
 PAGE_SIZE   = int(os.getenv("PAGE_SIZE", "50"))
 
-RELAY_VERSION = "v39"
+# Brunel (9 Oct 2026): releases are named after great railway engineers, in this order:
+# Brunel, Stephenson, Telford, Gresley, Locke, Fowler, Hackworth, Trevithick, Churchward, Stanier.
+# A minor update adds .1, .2 (Brunel.1). RELAY_BUILD keeps counting up for checks.
+RELAY_VERSION = "Brunel"
+RELAY_BUILD = 40
 
 # ── relay access ─────────────────────────────────────────────────────────────
 APP_KEY    = os.getenv("APP_KEY", "")
@@ -299,7 +303,7 @@ async def health():
         fms = {k: FMS_STATUS[k] for k in ("ok", "since", "detail")}
     except Exception:                                   # noqa: BLE001
         fms = {"ok": True, "since": 0, "detail": ""}
-    return {"ok": True, "version": RELAY_VERSION, "otdrMode": fc.OTDR_MODE, "fms": fms, "origins": ALLOWED_ORIGINS, "auth_host": AUTH_BASE, "topo_host": TOPO_HOST,
+    return {"ok": True, "version": RELAY_VERSION, "build": RELAY_BUILD, "otdrMode": fc.OTDR_MODE, "fms": fms, "origins": ALLOWED_ORIGINS, "auth_host": AUTH_BASE, "topo_host": TOPO_HOST,
             "graphql": GRAPHQL_URL, "tone": "live" if LIVE_TONE else "simulated",
             "tone_id_field": TONE_ID_FIELD, "cached": len(ROUTE_ID_CACHE), "rtus": len(RTU_INDEX), "client": CLIENT_ID}
 

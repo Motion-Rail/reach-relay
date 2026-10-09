@@ -49,6 +49,7 @@ def rplabel(f: int) -> str:
 @dataclass
 class Options:
     retry_straight: int = 1      # extra attempts on the expected fibre
+    straight_tries: int = 2      # Brunel: goes on the expected fibre in the straight pass (relay sets 3, all short)
     retry_other: int = 0
     max_tests: int = 14          # budget per source fibre
     confirm: bool = True         # retest a cross before accepting it
@@ -361,7 +362,9 @@ class Engine:
             res = await self._t(f, f, test, control)
             if res is None:
                 return False
-            if res != "clash":
+            for _ in range(max(1, self.opts.straight_tries) - 1):
+                if res == "clash":
+                    break
                 res = await self._t(f, f, test, control, long=True)
                 if res is None:
                     return False
