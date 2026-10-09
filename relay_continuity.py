@@ -53,7 +53,8 @@ PACE = {                              # measured on RGAC2 -> SNBC, 28 Sep 2026
     # the tone only adds time above ~11 s. Tone 10 gives more cover for slow FMS starts.
     # Dark OTDR: 3 s -> 17.4-18.5 s; 5 s -> 17.5-18.5 s; 1 s -> 14-35 s (erratic).
     # Lead 1 s saved ~0.9 s a fibre but missed the first fibre once; kept at 2 s.
-    "default_tone_s": 4,
+    "default_tone_s": 10,              # Brunel.2 (9 Oct, live): FMS starts the OTDR 9 to 16 s after the tone call, so a
+                                       # 4 s tone had ended (9 of 12 rechecked, 17 s a fibre); 10 s: no rechecks, about 13 s a fibre
     "default_lead_s": 2,
     "max_tone_s": 20,
     "cover_tone_s": 20,               # old runs only: long tone on the first test and after a miss
@@ -68,7 +69,7 @@ PACE = {                              # measured on RGAC2 -> SNBC, 28 Sep 2026
     "outage_wait_s": 60,              # v22: FMS not answering: wait, then retry the same test
     "outage_limit_s": 7200,           #      give up (run fails, resumable) after 2 h                # v20: acquisition must start at least this long before the tone ends              # v18: a dark result later than tone start + tone + this is rechecked
 }
-RELAY_VERSION = "Brunel.1"   # kept in step with main.py
+RELAY_VERSION = "Brunel.2"   # kept in step with main.py
 JOBS: dict[str, dict] = {}
 LOCKS: dict[str, asyncio.Lock] = {}
 ROUTES: dict[str, dict[str, dict]] = {}          # rtuName -> {routeName: node}
