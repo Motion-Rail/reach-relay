@@ -283,6 +283,10 @@ async def _rtu_name_for(token, rtu_id):
     name = (RTU_INDEX.get(k) or {}).get("rtuName") or ""
     if name:
         return name
+    # Brunel 1.0.2: the console's /api/rtus call records RTU name -> rtuId here on every load
+    for rname, st in list(_RTU_STATE.items()):
+        if str((st or {}).get("rtuId", "")) == k:
+            return rname
     try:
         headers = {"Authorization": f"Bearer {token}"}
         async with httpx.AsyncClient(timeout=20) as c:
@@ -309,6 +313,13 @@ async def _resolve_route_id(token, fibre, rtu_id):
         rtu_name = await _rtu_name_for(token, rtu_id)
         if rtu_name:
             await _crawl(token, rtu_name)
+    if key not in ROUTE_ID_CACHE:
+        # Brunel 1.0.2: last resort, every RTU name the console has asked about
+        for rname, st in list(_RTU_STATE.items()):
+            if key in ROUTE_ID_CACHE:
+                break
+            if (st or {}).get("found") and str(st.get("rtuId", "")) in ("", str(rtu_id)):
+                await _crawl(token, rname)
     if key not in ROUTE_ID_CACHE:
         await _crawl(token, _stem(fibre))          # older fallbacks, kept
     if key not in ROUTE_ID_CACHE:
