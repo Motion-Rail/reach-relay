@@ -16,6 +16,7 @@ Wired end to end from captured requests:
 Set LIVE_TONE=1 to actually call EXFO; otherwise tones are simulated.
 """
 
+import hmac
 import os
 import re
 import asyncio
@@ -23,7 +24,7 @@ import json
 import time
 import uuid
 import httpx
-from fastapi import FastAPI, HTTPException, Header
+from fastapi import FastAPI, HTTPException, Header, Request
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
 import fms_continuity as fc
@@ -54,11 +55,17 @@ PAGE_SIZE   = int(os.getenv("PAGE_SIZE", "50"))
 # Brunel (9 Oct 2026): releases are named after great railway engineers, in this order:
 # Brunel, Stephenson, Telford, Gresley, Locke, Fowler, Hackworth, Trevithick, Churchward, Stanier.
 # A minor update adds .1, .2 (Brunel.1). RELAY_BUILD keeps counting up for checks.
-RELAY_VERSION = "Brunel.4"
-RELAY_BUILD = 44
+RELAY_VERSION = "Brunel.6"
+RELAY_BUILD = 45
 
 # ── relay access ─────────────────────────────────────────────────────────────
 APP_KEY    = os.getenv("APP_KEY", "")
+# Brunel.6: while the app key is being changed, the old one (APP_KEY_PREV) is still accepted so phones
+# holding the previous page keep working until they reload. Remove APP_KEY_PREV once everyone has updated.
+APP_KEY_PREV = os.getenv("APP_KEY_PREV", "")
+# Brunel.6: the app now sends this key. It is not a secret (it ships in the page), so it lives here and no
+# Render setting has to change on deploy. Once APP_KEY in Render is set to this value, the old key stops working.
+APP_KEY_BUILTIN = "SwhW5ty8sbhflHU6k7ILRodJiyCpGQP4"
 APP_ORIGIN = os.getenv("APP_ORIGIN", "*")
 # v13: the app moved to motionrail.onrender.com. APP_ORIGIN (env) may hold one or more
 # comma-separated origins; APP_ORIGINS_EXTRA adds more without touching APP_ORIGIN.
@@ -86,19 +93,28 @@ from relay_resume import resume_blob as _resume_blob, read_blob as _read_resume
 RESUMED = {"n": 0, "failed": 0}
 
 
+import relay_security as sec                                   # Brunel.6 hardening
+sec.load_revoke_async()
+
+
 @app.middleware("http")
 async def _resume_mw(request, call_next):
     sid = request.headers.get("x-session") or ""
     blob = request.headers.get("x-resume") or ""
+    sec.sweep(SESSIONS)                                 # Brunel.6: drop idle sessions (at most once a minute)
+    if sid:
+        sec.touch(SESSIONS, sid)                        # Brunel.6: ends an idle session, else counts as activity
     if sid and blob and sid not in SESSIONS:
         rec = _read_resume(blob, sid)
-        if rec:
+        if rec and sec.resume_allowed(rec):
             try:
                 _store(sid, await _refresh_grant(rec["refresh"]), rec["user"], keep=bool(rec.get("keep")))
                 RESUMED["n"] += 1
             except Exception:                           # noqa: BLE001
                 RESUMED["failed"] += 1
-    return await call_next(request)
+    response = await call_next(request)
+    sec.add_headers(request, response)
+    return response
 ROUTE_ID_CACHE: dict[str, dict] = {}    # "RTUID|FIBRENAME" -> {"id","rtuId","rtuName","site"}
 RTU_INDEX: dict[str, dict] = {}         # rtuId -> {"rtuName","site"}
 
@@ -125,7 +141,9 @@ def _stem(fibre):
     return re.sub(r"-F\d+$", "", fibre, flags=re.I)
 
 def _check_key(x_app_key):
-    if APP_KEY and x_app_key != APP_KEY:
+    k = str(x_app_key or "")
+    if APP_KEY and not (hmac.compare_digest(k, APP_KEY) or hmac.compare_digest(k, APP_KEY_BUILTIN)
+                        or (APP_KEY_PREV and hmac.compare_digest(k, APP_KEY_PREV))):
         raise HTTPException(401, "Bad or missing app key")
 
 
@@ -151,10 +169,12 @@ async def _password_grant(username, password, keep=False):
             tok["_keep"] = "offline_access" in str(tok.get("scope") or "")
             return tok
         if r.status_code == 401 or "invalid_grant" in r.text:
-            raise HTTPException(401, f"EXFO login failed ({r.status_code}): {r.text[:200]}")
+            raise HTTPException(401, "FMS sign in failed: check the username and password")
     r = await _grant({"grant_type": "password", "username": username, "password": password})
-    if r.status_code != 200:
-        raise HTTPException(401, f"EXFO login failed ({r.status_code}): {r.text[:200]}")
+    if r.status_code != 200:                            # Brunel.6: FMS's own reply is not passed back
+        raise HTTPException(401 if r.status_code in (400, 401) else 502,
+                            "FMS sign in failed: check the username and password" if r.status_code in (400, 401)
+                            else f"FMS sign in service not available ({r.status_code})")
     return r.json()
 
 async def _refresh_grant(refresh_token):
@@ -167,8 +187,10 @@ def _store(sid, tok, user, keep=None):
     ttl = int(tok.get("expires_in", TOKEN_TTL_FALLBACK))
     if keep is None:                                    # a refresh keeps the session's keep signed in choice
         keep = bool((SESSIONS.get(sid) or {}).get("keep"))
+    old = SESSIONS.get(sid) or {}
     SESSIONS[sid] = {"access": tok["access_token"], "refresh": tok.get("refresh_token", ""),
-                     "exp": time.time() + ttl - min(150, ttl // 2), "user": user, "keep": bool(keep)}
+                     "exp": time.time() + ttl - min(150, ttl // 2), "user": user, "keep": bool(keep),
+                     "born": old.get("born") or time.time(), "seen": old.get("seen") or time.time()}
 
 async def _valid_token(sid):
     s = SESSIONS.get(sid)
@@ -303,14 +325,24 @@ async def health():
         fms = {k: FMS_STATUS[k] for k in ("ok", "since", "detail")}
     except Exception:                                   # noqa: BLE001
         fms = {"ok": True, "since": 0, "detail": ""}
-    return {"ok": True, "version": RELAY_VERSION, "build": RELAY_BUILD, "otdrMode": fc.OTDR_MODE, "fms": fms, "origins": ALLOWED_ORIGINS, "auth_host": AUTH_BASE, "topo_host": TOPO_HOST,
-            "graphql": GRAPHQL_URL, "tone": "live" if LIVE_TONE else "simulated",
-            "tone_id_field": TONE_ID_FIELD, "cached": len(ROUTE_ID_CACHE), "rtus": len(RTU_INDEX), "client": CLIENT_ID}
+    # Brunel.6: /health is public, so it no longer lists hosts, origins or the FMS client id.
+    return {"ok": True, "version": RELAY_VERSION, "build": RELAY_BUILD, "otdrMode": fc.OTDR_MODE, "fms": fms,
+            "tone": "live" if LIVE_TONE else "simulated"}
 
 @app.post("/api/login")
-async def login(body: LoginIn, x_app_key: str | None = Header(default=None)):
+async def login(body: LoginIn, request: Request, x_app_key: str | None = Header(default=None)):
     _check_key(x_app_key)
-    tok = await _password_grant(body.username, body.password, keep=body.keep)
+    ip = sec.client_ip(request)
+    wait = sec.login_blocked(ip, body.username)         # Brunel.6: 5 failed sign ins in 15 min, then a pause
+    if wait:
+        raise HTTPException(429, f"Too many failed sign ins. Try again in {max(1, wait // 60)} min.")
+    try:
+        tok = await _password_grant(body.username, body.password, keep=body.keep)
+    except HTTPException as e:
+        if e.status_code == 401:
+            sec.login_failed(ip, body.username)
+        raise
+    sec.login_ok(ip, body.username)
     sid = uuid.uuid4().hex
     keep = bool(tok.pop("_keep", False))
     _store(sid, tok, body.username, keep=keep)
@@ -321,6 +353,12 @@ async def logout(x_app_key: str | None = Header(default=None), x_session: str | 
     """v37: sign out ends the FMS sign in too (matters for a keep me signed in offline sign in)."""
     _check_key(x_app_key)
     s = SESSIONS.pop(x_session or "", None)
+    await _logout_fms(s)
+    return {"ok": True}
+
+
+async def _logout_fms(s):
+    """End the FMS (Keycloak) sign in behind a session. Best effort."""
     if s and s.get("refresh"):
         data = {"client_id": CLIENT_ID, "refresh_token": s["refresh"]}
         if CLIENT_SECRET: data["client_secret"] = CLIENT_SECRET
@@ -330,7 +368,6 @@ async def logout(x_app_key: str | None = Header(default=None), x_session: str | 
                              headers={"Content-Type": "application/x-www-form-urlencoded"})
         except Exception:                               # noqa: BLE001
             pass
-    return {"ok": True}
 
 @app.post("/api/routes")
 async def routes(body: PrimeIn, x_app_key: str | None = Header(default=None),
@@ -515,3 +552,6 @@ app.include_router(_report_router(_valid_token, _check_key, SESSIONS))
 # ── Brunel.3: the full FMS Test Results Report (the PC tool's engine) from the app (see relay_fullreport.py) ──
 from relay_fullreport import make_router as _fullreport_router
 app.include_router(_fullreport_router(_valid_token, _check_key, SESSIONS))
+
+# ── Brunel.6: admin security endpoints (sign out everywhere, status) ──
+app.include_router(sec.make_router(_check_key, SESSIONS, _logout_fms))

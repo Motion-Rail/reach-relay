@@ -17,8 +17,8 @@ import json
 import os
 import time
 
-MAX_AGE_S = int(os.getenv("RESUME_MAX_AGE_S", str(12 * 3600)))
-KEEP_MAX_AGE_S = int(os.getenv("RESUME_KEEP_MAX_AGE_S", str(30 * 86400)))   # v37: keep me signed in (FMS offline sign in)
+MAX_AGE_S = int(os.getenv("RESUME_MAX_AGE_S", str(8 * 3600)))       # Brunel.6: 12 h cut to 8 h, the same as the idle timeout
+KEEP_MAX_AGE_S = int(os.getenv("RESUME_KEEP_MAX_AGE_S", str(7 * 86400)))    # v37: keep me signed in; Brunel.6: 30 days cut to 7
 
 
 def _key() -> bytes | None:
