@@ -275,15 +275,44 @@ async def _prime(token, search, rtu_id=None, max_pages=20):
     return len(nodes), total
 
 
+async def _rtu_name_for(token, rtu_id):
+    """RTU name for an id: from RTU_INDEX if known, else GET /api/topology/remotetestunits/{id}."""
+    k = str(rtu_id or "")
+    if not k:
+        return ""
+    name = (RTU_INDEX.get(k) or {}).get("rtuName") or ""
+    if name:
+        return name
+    try:
+        headers = {"Authorization": f"Bearer {token}"}
+        async with httpx.AsyncClient(timeout=20) as c:
+            r = await c.get(TOPO_HOST.rstrip("/") + f"/api/topology/remotetestunits/{k}", headers=headers)
+        if 200 <= r.status_code < 300:
+            j = r.json()
+            name = j.get("name") or j.get("rtuName") or j.get("Name") or ""
+    except Exception:                               # noqa: BLE001
+        name = ""
+    if name:
+        RTU_INDEX.setdefault(k, {"rtuName": name, "site": "", "attachStatus": "", "online": True})
+    return name
+
+
 async def _resolve_route_id(token, fibre, rtu_id):
     """Resolve a fibre name to its OpticalRouteID for a SPECIFIC RTU."""
     if not rtu_id:
         raise HTTPException(400, "rtuId is required — the same cable exists at both ends")
     key = f"{rtu_id}|{fibre.upper()}"
     if key not in ROUTE_ID_CACHE:
-        await _crawl(token, _stem(fibre))          # prime the whole cable
+        # Brunel 1.0.1: searchOpticalRouteByRtu matches the RTU NAME, so after a relay
+        # restart (empty cache) prime by the RTU's own name first. Searching by the
+        # cable stem or route name matches nothing.
+        rtu_name = await _rtu_name_for(token, rtu_id)
+        if rtu_name:
+            await _crawl(token, rtu_name)
     if key not in ROUTE_ID_CACHE:
-        await _crawl(token, fibre)                 # fall back to exact name
+        await _crawl(token, _stem(fibre))          # older fallbacks, kept
+    if key not in ROUTE_ID_CACHE:
+        await _crawl(token, fibre)
     if key not in ROUTE_ID_CACHE:
         raise HTTPException(404, f"No OpticalRouteID for {fibre} on RTU {rtu_id}")
     entry = ROUTE_ID_CACHE[key]
