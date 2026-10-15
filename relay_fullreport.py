@@ -47,6 +47,7 @@ JOBS: dict[str, dict] = {}
 QUEUE: list[str] = []
 LOCK = threading.Lock()
 KEEP_S = 6 * 3600
+UNSAVED_KEEP_S = 7 * 86400            # Brunel.6.1: a report not yet in Report history is kept on the relay
 MAX_CLIENT = 15 * 1024 * 1024
 
 
@@ -64,6 +65,7 @@ class StartIn(BaseModel):
     clientName: str = ""
     taskId: str = ""
     label: str = ""
+    endA: str = ""              # Brunel 1.0: the cable's End A RTU, so a report from End B only is turned round
 
 
 class IdIn(BaseModel):
@@ -110,22 +112,47 @@ def gh_get_bytes(path: str) -> bytes | None:
     return r.content
 
 
-def gh_put_bytes(path: str, data: bytes, message: str) -> bool:
+REPO_LOCK = threading.Lock()                 # one write to the log repo at a time from this module
+
+
+def gh_put_bytes(path: str, data: bytes, message: str, tries: int = 6) -> bool:
+    """Write a file to LOG_REPO. Brunel.6.1: retried with a fresh sha when GitHub answers 409 (another
+    commit landed on the branch at the same moment, which happens while a long E2E run is saving its
+    logs), 422, 5xx or a dropped connection. Waits 1, 2, 4, 8, 16 s between tries."""
     if not repo_on():
         return False
     url = f"{LOG_API}/repos/{LOG_REPO}/contents/{path}"
-    sha = None
-    g = requests.get(url, headers=_h(), timeout=30)
-    if g.ok:
-        try:
-            sha = (g.json() or {}).get("sha")
-        except ValueError:
-            sha = None
     body = {"message": message, "content": base64.b64encode(data).decode()}
-    if sha:
-        body["sha"] = sha
-    r = requests.put(url, headers=_h(), json=body, timeout=120)
-    return r.ok
+    last = ""
+    with REPO_LOCK:
+        for n in range(tries):
+            if n:
+                time.sleep(min(2 ** (n - 1), 16))
+            try:
+                g = requests.get(url, headers=_h(), timeout=30)
+                sha = None
+                if g.ok:
+                    try:
+                        sha = (g.json() or {}).get("sha")
+                    except ValueError:
+                        sha = None
+                body.pop("sha", None)
+                if sha:
+                    body["sha"] = sha
+                r = requests.put(url, headers=_h(), json=body, timeout=180)
+                if r.ok:
+                    return True
+                last = f"{r.status_code} {r.text[:120]}"
+                if r.status_code not in (409, 422, 429) and r.status_code < 500:
+                    break
+            except requests.RequestException as e:
+                last = str(e)[:120]
+    STATS["putFails"].append({"path": path, "why": last, "at": time.time()})
+    del STATS["putFails"][:-20]
+    return False
+
+
+STATS: dict = {"putFails": []}
 
 
 def gh_get_json(path: str, default):
@@ -158,7 +185,7 @@ def public(j: dict) -> dict:
     pos = QUEUE.index(j["id"]) + 1 if j["id"] in QUEUE else 0
     return {k: j.get(k) for k in ("id", "state", "stem", "rtuA", "rtuB", "ribbons", "testType", "dfrom", "dto", "nominal",
                                   "user", "label", "taskId", "started", "ended", "fileName", "logName", "error", "note",
-                                  "size", "saved", "clientName")} | {
+                                  "size", "saved", "saveError", "clientName", "learn", "locMode")} | {
         "done": done, "total": tot, "pct": round(100 * done / tot) if tot else 0, "queuePos": pos,
         "stage": j.get("stage", ""), "tail": j.get("tail", [])[-8:]}
 
@@ -166,7 +193,8 @@ def public(j: dict) -> dict:
 def _tidy():
     now = time.time()
     for k, j in list(JOBS.items()):
-        if j.get("ended") and now - j["ended"] > KEEP_S:
+        unsaved = j.get("state") == "done" and not j.get("saved") and repo_on()
+        if j.get("ended") and now - j["ended"] > (UNSAVED_KEEP_S if unsaved else KEEP_S):
             shutil.rmtree(j.get("dir") or "", ignore_errors=True)
             JOBS.pop(k, None)
 
@@ -182,6 +210,120 @@ def _locations_for(stem: str, folder: str) -> str:
     return SEED_LOC.get(key, "") if os.path.exists(SEED_LOC.get(key, "") or "/nonexistent") else ""
 
 
+def _index_read():
+    """reports/index.json as a list, [] when it does not exist yet, or None when it could not be read.
+    None never leads to a write, so a passing GitHub fault can not wipe Report history."""
+    try:
+        r = requests.get(f"{LOG_API}/repos/{LOG_REPO}/contents/reports/index.json", headers=_h(raw=True), timeout=60)
+    except requests.RequestException:
+        return None
+    if r.status_code == 404:
+        return []
+    if not r.ok:
+        return None
+    try:
+        b = r.content
+        if "json" in (r.headers.get("content-type") or "") and b[:1] == b"{":
+            b = base64.b64decode((r.json() or {}).get("content") or "")
+        v = json.loads(b.decode("utf-8"))
+        return v if isinstance(v, list) else None
+    except Exception:                       # noqa: BLE001
+        return None
+
+
+def _index_add(entry: dict) -> bool:
+    """Add one report to reports/index.json and read it back to be sure it is there."""
+    for n in range(4):
+        if n:
+            time.sleep(2 ** n)
+        idx = _index_read()
+        if idx is None:
+            continue
+        if not any(x.get("id") == entry["id"] for x in idx):
+            idx.insert(0, entry)
+            if not gh_put_bytes("reports/index.json", json.dumps(idx[:500], indent=1).encode(), "report index"):
+                continue
+        back = _index_read()
+        if back and any(x.get("id") == entry["id"] for x in back):
+            return True
+    return False
+
+
+def _save(j: dict) -> bool:
+    """Keep a finished report in LOG_REPO so Report history survives restarts. Called when the report
+    finishes and again by the retry loop until it works. Until then the report stays on this relay."""
+    try:
+        mon = time.strftime("%Y-%m", time.gmtime(j.get("ended") or time.time()))
+        j["repoPath"] = j.get("repoPath") or f"reports/{mon}/{j['fileName']}"
+        folder = j["repoPath"].rsplit("/", 1)[0]
+        if not j.get("fileSaved"):
+            j["fileSaved"] = gh_put_bytes(j["repoPath"], open(j["path"], "rb").read(), f"report {j['fileName']}")
+        if j.get("logPath") and not j.get("logSaved"):
+            j["logSaved"] = gh_put_bytes(f"{folder}/{j['logName']}", open(j["logPath"], "rb").read(),
+                                         f"run log {j['logName']}")
+        if j.get("learnPath") and not j.get("learnSaved"):        # Brunel 1.0
+            import relay_assets
+            j["learnSaved"] = relay_assets.merge_run(j["learnKey"], j["learnPath"])
+        hp = os.path.join(ENGINE, "remedial_history.json")
+        if os.path.exists(hp) and not j.get("histSaved"):
+            j["histSaved"] = gh_put_bytes("config/remedial_history.json", open(hp, "rb").read(), "remedial history")
+        if j["fileSaved"]:
+            entry = {k: j.get(k) for k in ("id", "stem", "rtuA", "rtuB", "ribbons", "testType", "dfrom", "dto",
+                                           "nominal", "user", "label", "taskId", "fileName", "logName", "size",
+                                           "repoPath", "ended", "clientName", "locations", "locMode", "learn")}
+            if not _index_add(entry):
+                j["saveError"] = "Saved the workbook but could not add it to Report history yet"
+            elif j.get("learnPath") and not j.get("learnSaved"):
+                j["saveError"] = "In Report history, but the learned locations are not saved yet"
+            else:
+                j["saved"], j["saveError"] = True, ""
+                return True
+        else:
+            j["saveError"] = "Could not save to Report history yet (" + \
+                ((STATS["putFails"][-1]["why"] if STATS["putFails"] else "") or "storage off") + ")"
+    except Exception as e:                  # noqa: BLE001
+        j["saveError"] = "Could not save to Report history yet (" + str(e)[:120] + ")"
+    j["saveTries"] = j.get("saveTries", 0) + 1
+    _retry_later()
+    return False
+
+
+_RETRY = {"on": False}
+
+
+def _retry_later():
+    """Keep trying unsaved reports every 5 minutes while the relay runs."""
+    if _RETRY["on"] or not repo_on():
+        return
+    _RETRY["on"] = True
+
+    def loop():
+        try:
+            while True:
+                time.sleep(RETRY_S)
+                todo = [j for j in list(JOBS.values()) if j.get("state") == "done" and not j.get("saved")
+                        and j.get("path") and os.path.exists(j["path"])]
+                if not todo:
+                    return
+                for j in todo:
+                    _save_quiet(j)
+        finally:
+            _RETRY["on"] = False
+    threading.Thread(target=loop, daemon=True).start()
+
+
+def _save_quiet(j: dict) -> None:
+    on = _RETRY["on"]
+    _RETRY["on"] = True                     # stop _save starting a second loop from inside this one
+    try:
+        _save(j)
+    finally:
+        _RETRY["on"] = on
+
+
+RETRY_S = int(os.getenv("REPORT_RETRY_S", "300"))
+
+
 def _run(j: dict, token_fn):
     """One report, start to finish, in its own process."""
     folder = j["dir"]
@@ -191,15 +333,29 @@ def _run(j: dict, token_fn):
         if hist:
             with open(os.path.join(ENGINE, "remedial_history.json"), "wb") as fh:
                 fh.write(hist)
-        loc = _locations_for(j["stem"], folder)
-        j["locations"] = os.path.basename(loc) if loc else ""
+        # Brunel 1.0: learned locations, or the cable's Distances schedule
+        import relay_assets
+        key = cable_key(j["stem"])
+        mode, lst = relay_assets.mode_for(key)
+        learned = learn_out = ""
+        if mode == "learned" and lst is not None:
+            learned, learn_out = os.path.join(folder, "learned.json"), os.path.join(folder, "learned_out.json")
+            with open(learned, "w", encoding="utf-8") as fh:
+                json.dump(lst, fh)
+            loc = ""
+            j["locations"], j["locMode"] = "Learned locations", "learned"
+        else:
+            loc = _locations_for(j["stem"], folder)
+            j["locations"], j["locMode"] = (os.path.basename(loc) if loc else ""), "schedule"
         verify = ""
         if j.get("clientPath"):
             verify = j["clientPath"]
         cfg = {"rtuA": j["rtuA"], "rtuB": j["rtuB"], "ribbons": j["ribbons"], "testType": j["testType"],
                "from": j["dfrom"], "to": j["dto"], "nominal": j["nominal"], "viewWl": j["viewWl"],
                "locations": loc, "verify": verify, "user": j["user"], "out": os.path.join(folder, "out"),
-               "fmsBase": FMS_BASE}
+               "fmsBase": FMS_BASE, "learned": learned, "learnOut": learn_out, "cable": key,
+               "reportName": j["stem"] + " " + time.strftime("%d-%m-%y %H:%M", time.gmtime()),
+               "fromB": bool(j.get("endA") and j["rtuA"] != j["endA"])}
         env = {**os.environ, "REPORT_JOB": json.dumps(cfg), "PYTHONUNBUFFERED": "1", "MALLOC_ARENA_MAX": "2"}
         p = subprocess.Popen([sys.executable, os.path.join(HERE, "report_job.py")], cwd=HERE, env=env, text=True,
                              stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, bufsize=1)
@@ -234,6 +390,11 @@ def _run(j: dict, token_fn):
                 files = json.loads(line[5:]).get("files") or []
             elif line.startswith("ERROR|"):
                 j["error"] = line[6:]
+            elif line.startswith("LEARN|"):
+                try:
+                    j["learn"] = json.loads(line[6:])
+                except ValueError:
+                    pass
             elif line.strip():
                 j["tail"].append(line.strip()[:200])
                 del j["tail"][:-60]
@@ -255,25 +416,10 @@ def _run(j: dict, token_fn):
         if os.path.exists(log):
             j["logPath"], j["logName"] = log, os.path.basename(log)
         j["state"], j["note"], j["ended"] = "done", "Ready", time.time()
+        if learn_out and os.path.exists(learn_out):
+            j["learnPath"], j["learnKey"] = learn_out, key
         # keep it: the workbook, its run log, the index, and the remedial history
-        try:
-            mon = time.strftime("%Y-%m", time.gmtime())
-            j["repoPath"] = f"reports/{mon}/{j['fileName']}"
-            ok = gh_put_bytes(j["repoPath"], open(xl, "rb").read(), f"report {j['fileName']}")
-            if j.get("logPath"):
-                gh_put_bytes(f"reports/{mon}/{j['logName']}", open(j["logPath"], "rb").read(), f"run log {j['logName']}")
-            hp = os.path.join(ENGINE, "remedial_history.json")
-            if os.path.exists(hp):
-                gh_put_bytes("config/remedial_history.json", open(hp, "rb").read(), "remedial history")
-            if ok:
-                idx = gh_get_json("reports/index.json", [])
-                idx.insert(0, {k: j.get(k) for k in ("id", "stem", "rtuA", "rtuB", "ribbons", "testType", "dfrom", "dto",
-                                                      "nominal", "user", "label", "taskId", "fileName", "logName", "size",
-                                                      "repoPath", "ended", "clientName", "locations")})
-                gh_put_bytes("reports/index.json", json.dumps(idx[:500], indent=1).encode(), "report index")
-                j["saved"] = True
-        except Exception as e:              # noqa: BLE001
-            j["saveError"] = str(e)[:200]
+        _save(j)
     except Exception as e:                  # noqa: BLE001
         j["state"], j["error"], j["note"] = "error", str(e)[:400], "Failed"
     finally:
@@ -341,7 +487,8 @@ def make_router(valid_token, check_key, sessions: dict) -> APIRouter:
              "dto": body.dto, "nominal": body.nominal, "viewWl": body.viewWl or "1550", "user": user,
              "label": body.label.strip()[:120], "taskId": body.taskId.strip()[:40], "started": time.time(), "ended": None,
              "dir": folder, "totals": {}, "done": {}, "tail": [], "note": "Waiting for the report before it", "error": "",
-             "fileName": "", "logName": "", "size": 0, "saved": False, "session": x_session, "clientName": ""}
+             "fileName": "", "logName": "", "size": 0, "saved": False, "session": x_session, "clientName": "",
+             "endA": body.endA.strip().upper()}
         if body.client:
             raw = base64.b64decode(body.client)
             if len(raw) > MAX_CLIENT:

@@ -9,6 +9,8 @@ Arguments come as one JSON object in the REPORT_JOB environment variable:
    "from": "", "to": "", "nominal": 0.02, "viewWl": "1550", "locations": "/path/Distances.xlsx" or "",
    "verify": "/path/client.xlsx" or "", "user": "alkis@...", "out": "/tmp/dir", "fmsBase": "https://..."}
 Progress lines on stdout start with "PROG|", "STAGE|" or "DONE|".
+Brunel 1.0 adds "learned" (the cable's learned locations state file), "learnOut" (where the updated state is
+written), "cable", "reportName" and "fromB" (the run is from End B only); a "LEARN|" line reports what was learned.
 """
 from __future__ import annotations
 
@@ -140,6 +142,116 @@ def _wizard(args):
 fms_pull.wizard = _wizard
 
 
+# ── Brunel 1.0: learned locations ──
+# When the relay passes "learned" (the cable's learned state file), the report learns joint locations from this
+# run's events, names events after them, and the engine reads them as its location schedule. LEARNED_SRC is the
+# --locations value that means "use the learned list"; no workbook is involved.
+import bidir_report  # noqa: E402
+import learned_locations as ll  # noqa: E402
+
+LEARNED_SRC = "learned-locations"
+LEARN: dict = {"state": None, "lengths": {}, "done": False, "summary": None}
+
+
+def _learn_load():
+    if LEARN["state"] is None:
+        try:
+            with open(CFG["learned"], encoding="utf-8") as fh:
+                st = json.load(fh)
+        except (OSError, ValueError, KeyError):
+            st = None
+        LEARN["state"] = ll.fix_state(st, CFG.get("cable") or "")
+    return LEARN["state"]
+
+
+def _a_frame(rows, lengths):
+    """A report run from End B only measures from the west end; learned distances are from End A."""
+    if not CFG.get("fromB"):
+        return rows
+    out = []
+    for e in rows:
+        L = lengths.get(e.get("fid"))
+        if e.get("position") is not None and L:
+            e = dict(e, position=L - e["position"], _bpos=e["position"])
+        out.append(e)
+    return out
+
+
+_aet0 = fms_pull.all_events_table
+
+
+def _all_events(rowsA_raw, rowsB_raw, *a, **kw):
+    rows = _aet0(rowsA_raw, rowsB_raw, *a, **kw)
+    if not CFG.get("learned"):
+        return rows
+    st = _learn_load()
+    lengths = {r.get("fid"): r.get("length") for r in rowsA_raw if r.get("fid")}
+    LEARN["lengths"].update(lengths)
+    if not LEARN["done"] and rows:
+        LEARN["done"] = True
+        two = bool(rowsB_raw) and not kw.get("single", a[0] if a else False)
+        summ = ll.learn(st, _a_frame([dict(e) for e in rows], lengths), lengths, report=CFG.get("reportName") or "",
+                        two_ended=two, threshold=0.15, nominal=float(CFG.get("nominal", 0.02)))
+        LEARN["summary"] = summ
+        say("LEARN|" + json.dumps({k: v for k, v in summ.items() if k != "newIds"}))
+        with open(CFG["learnOut"], "w", encoding="utf-8") as fh:
+            json.dump(st, fh, indent=1)
+        _set_engine_hooks(st)
+    return rows
+
+
+def _set_engine_hooks(st):
+    tag = ll.tagger(st, LEARN["lengths"])
+
+    def locate(fid, pos):
+        if CFG.get("fromB"):
+            L = LEARN["lengths"].get(fid)
+            pos = (L - pos) if (L and pos is not None) else pos
+        return tag(fid, pos)
+    bidir_report.LOCATE = locate
+    bidir_report.ASSETS = ll.inventory(st)
+
+
+fms_pull.all_events_table = _all_events
+_pick0, _load0, _map0 = fms_pull.pick_sheet_for_cable, fms_pull.load_locations, fms_pull.map_locations
+
+
+def _pick(path, cable, site=None, verbose=True):
+    if str(path) == LEARNED_SRC:
+        return "Learned locations", {"cable": cable}
+    return _pick0(path, cable, site=site, verbose=verbose)
+
+
+def _load(path, sheet=None, verbose=True):
+    if str(path) == LEARNED_SRC:
+        return ll.schedule(_learn_load())
+    return _load0(path, sheet=sheet, verbose=verbose)
+
+
+def _map(events, sched, tol=120.0, prefer_actual=True, verbose=True):
+    if not CFG.get("learned"):
+        return _map0(events, sched, tol=tol, prefer_actual=prefer_actual, verbose=verbose)
+    st = _learn_load()
+    framed = _a_frame(events, LEARN["lengths"])
+    hits = ll.apply_tags(st, framed, LEARN["lengths"])
+    if CFG.get("fromB"):                     # names back onto the report's own (End B) events
+        for e, f in zip(events, framed):
+            for k in ("location", "locId", "leg"):
+                if k in f:
+                    e[k] = f[k]
+            if "sched_m" in f and f["sched_m"] is not None and LEARN["lengths"].get(e.get("fid")):
+                e["sched_m"] = round(LEARN["lengths"][e["fid"]] - f["sched_m"], 1)
+                e["delta_m"] = round(e["position"] - e["sched_m"], 1)
+    else:
+        events[:] = framed
+    if verbose:
+        print(f"  learned locations: {hits} of {len(events)} events named")
+    return hits
+
+
+fms_pull.pick_sheet_for_cable, fms_pull.load_locations, fms_pull.map_locations = _pick, _load, _map
+
+
 def main():
     out = CFG["out"]
     os.makedirs(out, exist_ok=True)
@@ -151,7 +263,9 @@ def main():
         argv += ["--from", CFG["from"]]
     if CFG.get("to"):
         argv += ["--to", CFG["to"]]
-    if CFG.get("locations"):
+    if CFG.get("learned"):
+        argv += ["--locations", LEARNED_SRC]
+    elif CFG.get("locations"):
         argv += ["--locations", CFG["locations"]]
     if CFG.get("verify"):
         argv += ["--verify", CFG["verify"]]
