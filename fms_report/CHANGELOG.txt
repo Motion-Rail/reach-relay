@@ -336,3 +336,7 @@ v0.2  (2026-08-14)   Raw trace reading
 v0.1  (2026-08-14)   Loop legs
   - Main and loop-back traces sharing a route name are paired as the two
     directions rather than one being discarded.
+
+Relay copy, Brunel 1.0 (15 Oct 2026): bidir_report.py gains LOCATE and ASSETS hooks (both None on the PC tool, so the PC
+tool behaves as before) and an Asset Inventory sheet used when a cable learns its locations in the app.
+

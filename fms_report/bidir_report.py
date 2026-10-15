@@ -22,6 +22,12 @@ from openpyxl.comments import Comment
 
 FNAME = 'Arial'
 
+# Brunel 1.0 (app relay): set by report_job.py when the cable uses learned locations.
+# LOCATE(fid, position) -> learned location id, so remedial history follows a location rather than a distance;
+# ASSETS = the asset inventory rows for an 'Asset Inventory' sheet. Both stay None on the PC tool.
+LOCATE = None
+ASSETS = None
+
 
 def _num(x):
     try:
@@ -92,6 +98,14 @@ def _remedial_status(splices, meta, settings, threshold=0.15, wl=1550):
         fid = str(s.get('fid'))
         pos = s.get('position')
         key = f"{fid}@{round(pos)}" if pos is not None else fid
+        lid = None
+        if LOCATE is not None and pos is not None:      # Brunel 1.0: keyed on the learned location
+            try:
+                lid = LOCATE(fid, pos)
+            except Exception:
+                lid = None
+        if lid:
+            key = f"{fid}#{lid}"
         rec = ch.get(key)
         if rec is None and pos is not None:            # match nearest within 25 m, same fibre
             best = None
@@ -105,7 +119,11 @@ def _remedial_status(splices, meta, settings, threshold=0.15, wl=1550):
                 if abs(kp - pos) <= 25 and (best is None or abs(kp - pos) < best[0]):
                     best = (abs(kp - pos), k, rv)
             if best:
-                key, rec = best[1], best[2]
+                if lid:                                  # carry the old distance entry over to the location
+                    ch.pop(best[1], None)
+                    rec = best[2]
+                else:
+                    key, rec = best[1], best[2]
         prev = rec.get('avg') if rec else None
         s['prev'] = prev
         s['change'] = (round(v - prev, 3) if (v is not None and prev is not None) else None)
@@ -124,6 +142,8 @@ def _remedial_status(splices, meta, settings, threshold=0.15, wl=1550):
             runs.append([date, round(v, 4)])
         ch[key] = {'avg': (round(v, 4) if v is not None else prev), 'date': date,
                    'fid': fid, 'pos': pos, 'runs': runs[-20:]}
+        if lid:
+            ch[key]['loc'] = lid
         seen.add(key)
 
     cleared = []
@@ -143,6 +163,76 @@ def _remedial_status(splices, meta, settings, threshold=0.15, wl=1550):
     except Exception:
         pass
     return cleared
+
+
+def _add_asset_inventory(wb, inv, meta):
+    """Brunel 1.0: one row per physical asset on the cable, learned from the test events and named from
+    the design, in route order from End A, with the current build end at the bottom."""
+    from openpyxl.styles import Font, PatternFill, Alignment, Border, Side
+    from openpyxl.utils import get_column_letter
+    FN = 'Arial'
+    navy = PatternFill('solid', fgColor='1F4E79')
+    amber = PatternFill('solid', fgColor='FFEB9C')
+    hair = Side(style='thin', color='D9D9D9')
+    bd = Border(left=hair, right=hair, top=hair, bottom=hair)
+    ctr = Alignment(horizontal='center', vertical='center', wrap_text=True)
+    lft = Alignment(horizontal='left', vertical='center')
+    ws = wb.create_sheet('Asset Inventory')
+    ws.sheet_view.showGridLines = False
+    rows = inv.get('rows') or []
+    ws.merge_cells('A1:N1')
+    ws['A1'] = f"Asset Inventory - {meta.get('cable', '')}   ({len(rows)} assets, learned from the test results)"
+    ws['A1'].font = Font(name=FN, size=13, bold=True, color='FFFFFF')
+    ws['A1'].fill = navy
+    ws['A1'].alignment = lft
+    unn = sum(1 for r in rows if not r.get('named'))
+    ws['A2'] = ("Each asset is a point where many fibres show an event at the same distance. Distances are optical "
+                "distance from End A, refined every report. Name unnamed assets on the app's Locations screen."
+                + (f"  {unn} still to name." if unn else ""))
+    ws['A2'].font = Font(name=FN, size=9, italic=True)
+    cols = ['Asset', 'Type', 'Optical distance from End A (m)', 'Match window (± m)', 'Design chainage',
+            'First seen', 'Last seen', 'Reports seen', 'Fibres with an event', 'Splices', 'Ribbons',
+            'Average splice loss @1550 (dB)', 'Worst splice loss @1550 (dB)', 'Splices at or over threshold']
+    H = 4
+    for c, h in enumerate(cols, 1):
+        x = ws.cell(H, c, h)
+        x.font = Font(name=FN, size=10, bold=True, color='FFFFFF')
+        x.fill = navy
+        x.alignment = ctr
+        x.border = bd
+    r = H + 1
+    for a in rows:
+        vals = [a.get('asset'), a.get('type') or '', a.get('distance_m'), a.get('tolerance_m'), a.get('chainage'),
+                a.get('first_seen'), a.get('last_seen'), a.get('tests_seen'),
+                (f"{a['fibres']} of {a['tested']}" if a.get('fibres') is not None and a.get('tested') else a.get('fibres')),
+                a.get('splices'), a.get('ribbons'), a.get('avg'), a.get('worst'), a.get('over')]
+        for c, v in enumerate(vals, 1):
+            x = ws.cell(r, c, v)
+            x.font = Font(name=FN, size=10, bold=(c == 1))
+            x.border = bd
+            x.alignment = lft if c in (1, 2) else ctr
+            if c in (3, 4, 5):
+                x.number_format = '#,##0.0'
+            if c in (12, 13):
+                x.number_format = '0.000'
+        if not a.get('named'):
+            for c in range(1, len(cols) + 1):
+                ws.cell(r, c).fill = amber
+        r += 1
+    be = inv.get('buildEnd') or {}
+    if be.get('distance_m'):
+        r += 1
+        ws.cell(r, 1, 'Current build end' if not be.get('complete') else 'End B (cable through)').font = Font(name=FN, size=10, bold=True, color='1F4E79')
+        x = ws.cell(r, 3, be['distance_m'])
+        x.number_format = '#,##0.0'
+        x.alignment = ctr
+        ws.cell(r, 6, be.get('at') or '').alignment = ctr
+        ws.cell(r, 9, f"{be.get('fibres') or ''} fibres").alignment = ctr
+    widths = [30, 12, 16, 12, 14, 17, 17, 10, 14, 10, 10, 14, 14, 14]
+    for i, w in enumerate(widths, 1):
+        ws.column_dimensions[get_column_letter(i)].width = w
+    ws.row_dimensions[H].height = 42
+    ws.freeze_panes = ws.cell(H + 1, 2)
 
 
 def _add_remedial_tracking(wb, splices, cleared, meta, settings, threshold=0.15):
@@ -607,7 +697,10 @@ def build_workbook(out_path, meta, settings, rowsA, rowsB,
     if cable_view:
         _add_cable_views(wb, cable_view, meta, settings, wls=view_wls, odf=odf)
 
-    order = ['Cover', 'Client Verify', 'Verify', 'Summary', 'Latest Test Check', 'OTDR Measured', 'Remedials', 'Remedial Tracking', 'Backsplice Remedials', 'All Events', 'Bidir E2E Loss Report', 'Cable_View', 'Detailed Cable View',
+    if ASSETS:
+        _add_asset_inventory(wb, ASSETS, meta)
+
+    order = ['Cover', 'Client Verify', 'Verify', 'Summary', 'Asset Inventory', 'Latest Test Check', 'OTDR Measured', 'Remedials', 'Remedial Tracking', 'Backsplice Remedials', 'All Events', 'Bidir E2E Loss Report', 'Cable_View', 'Detailed Cable View',
              f'Splices > {splice_threshold}dB',
              'ODF Connection', 'Raw A-B (End A)', 'Raw B-A (End B)', 'Config']
     order = [o for o in order if o in [s.title for s in wb._sheets]]
