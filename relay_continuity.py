@@ -27,6 +27,7 @@ every fibre would read "not found".
 from __future__ import annotations
 
 import asyncio
+import math
 import os
 import re
 import time
@@ -73,11 +74,16 @@ PACE = {                              # measured on RGAC2 -> SNBC, 28 Sep 2026
     # Each RTU's check waits for its own tone to end (one source per RTU), which also gives a slow
     # FMS start a few seconds more. A dark straight go is retried from the other end.
     "alt_tone_s": 10,                 # floor for the tone when alternating (offline: 12 s only added time)
+    # Brunel 1.0.5 (16 Oct, 10 runs on R1): when the checking RTU still has its own tone running, the far
+    # tone is lengthened by that wait plus this margin, so it is still on when the check finally starts.
+    # Before: SNBC tones / RGAC2 checks lit only 27 of 72 (27 checks started after the tone had ended).
+    "alt_extend_margin_s": 2,
+    "max_alt_tone_s": 15,             # cap: longer tones make the other end wait longer too, and it snowballs
     "busy_retry_s": 1,                # OTDR refused because that RTU is still toning: retry this often
     "busy_retries": 12,
     "outage_limit_s": 7200,           #      give up (run fails, resumable) after 2 h                # v20: acquisition must start at least this long before the tone ends              # v18: a dark result later than tone start + tone + this is rechecked
 }
-RELAY_VERSION = "Brunel 1.0.4"   # main.py copies its own over this at start up; bump both
+RELAY_VERSION = "Brunel 1.0.5"   # main.py copies its own over this at start up; bump both
 JOBS: dict[str, dict] = {}
 LOCKS: dict[str, asyncio.Lock] = {}
 ROUTES: dict[str, dict[str, dict]] = {}          # rtuName -> {routeName: node}
@@ -591,6 +597,8 @@ def make_router(valid_token, check_key, tone, live_tone: bool) -> APIRouter:
                     parts.append(f"waited {waits['tone']:.1f} s for {short_rtu(trtu)} to finish its last tone")
                 if waits["own"] >= 0.5:
                     parts.append(f"waited {waits['own']:.1f} s for {short_rtu(ortu)}'s own tone to end")
+                if waits.get("extendS"):
+                    parts.append(f"tone lengthened to {ts.get('len')} s to cover that wait")
                 if res.get("busyRetries"):
                     parts.append(f"{res['busyRetries']} busy retries")
                 eng.say(f"  {what}: tone {short_rtu(trtu)} → check {short_rtu(ortu)}: {desc} "
@@ -618,6 +626,12 @@ def make_router(valid_token, check_key, tone, live_tone: bool) -> APIRouter:
                     if wait > 0:                            # one source per RTU
                         await asyncio.sleep(wait + 0.5)
                         waits["tone"] = wait + 0.5
+                    if alt and trtu != ortu:
+                        # 1.0.5: the check at ortu cannot start until ortu's own tone ends; cover that wait
+                        own_left = tstate.get(ortu, {}).get("until", 0) - (time.time() + lead_s)
+                        if own_left > 0:
+                            tone_s = min(PACE["max_alt_tone_s"], math.ceil(tone_s + own_left + PACE["alt_extend_margin_s"]))
+                            waits["extendS"] = round(own_left + PACE["alt_extend_margin_s"], 1)
                     node = ROUTES[trtu].get(src_name.upper())
                     try:
                         t = await tone(x_session, src_name, str(node["rtuId"]),
@@ -732,6 +746,25 @@ def make_router(valid_token, check_key, tone, live_tone: bool) -> APIRouter:
                     f"{s['withinPct'][1]}%, within 3 goes {s['withinPct'][2]}%. Average go {s['avgGoS']} s.")
             return True
 
+        def direction_stats(log: list) -> dict:
+            """1.0.5: straight checks per direction (tone end > check end): goes, lit first time, late, dark."""
+            out = {}
+            for t in log:
+                if t.get("src") != t.get("cand") or not t.get("toneAt"):
+                    continue
+                k = f"{short_rtu(t['toneAt'])}>{short_rtu(t.get('otdrAt', ''))}"
+                d = out.setdefault(k, {"goes": 0, "lit": 0, "late": 0, "dark": 0})
+                d["goes"] += 1
+                key = {"clash": "lit", "late": "late", "clean": "dark"}.get(t.get("verdict"))
+                if key:
+                    d[key] += 1
+            return out
+
+        def direction_text(ds: dict) -> str:
+            return "; ".join(f"{k.replace('>', ' tones, ')} checks: lit {d['lit']} of {d['goes']}"
+                             + (f" ({d['late']} late, {d['dark']} dark)" if d["late"] or d["dark"] else "")
+                             for k, d in sorted(ds.items()))
+
         def pass_summary(k: int, p0: float, n0: int, done: bool) -> dict:
             log = [t for t in job["testLog"][n0:]]
             miss = [t for t in log if t.get("verdict") in ("clean", "late") and t.get("src") == t.get("cand")]
@@ -739,6 +772,7 @@ def make_router(valid_token, check_key, tone, live_tone: bool) -> APIRouter:
             return {"pass": k, "seconds": round(time.time() - p0, 1), "tests": len(log), "done": done,
                     "straight": sum(r.state == "straight" for r in res.values()), "fibres": len(targets),
                     "misses": len(miss), "missS": round(sum(t.get("cycleS") or 0 for t in miss), 1),
+                    "directions": direction_stats(log),
                     "missFibres": [ce.fname(f) + (f" ×{n}" if n > 1 else "")
                                    for f, n in sorted({t["src"]: sum(1 for x in miss if x["src"] == t["src"]) for t in miss}.items())]}
 
@@ -775,6 +809,8 @@ def make_router(valid_token, check_key, tone, live_tone: bool) -> APIRouter:
                             f"in {ps['seconds']:.0f} s, {ps['tests']} tests"
                             + (f", {ps['misses']} misses ({', '.join(ps['missFibres'])}) costing {ps['missS']:.0f} s"
                                if ps["misses"] else ", no misses"))
+                    if ps["directions"]:
+                        eng.say(f"  By direction: {direction_text(ps['directions'])}")
                     if not done:
                         break
                 full = [p for p in job["passes"] if p["done"]]
@@ -784,9 +820,18 @@ def make_router(valid_token, check_key, tone, live_tone: bool) -> APIRouter:
                                             "minS": min(secs), "maxS": max(secs),
                                             "avgMisses": round(sum(p["misses"] for p in full) / len(full), 1),
                                             "avgMissS": round(sum(p["missS"] for p in full) / len(full), 1)}
+                    tot = {}
+                    for p in full:
+                        for dk, dv in p.get("directions", {}).items():
+                            acc = tot.setdefault(dk, {"goes": 0, "lit": 0, "late": 0, "dark": 0})
+                            for f_ in acc:
+                                acc[f_] += dv.get(f_, 0)
+                    job["repeatSummary"]["directions"] = tot
                     r = job["repeatSummary"]
                     eng.say(f"Average of {r['runs']} runs: {r['avgS']:.0f} s a ribbon (fastest {r['minS']:.0f} s, "
                             f"slowest {r['maxS']:.0f} s); {r['avgMisses']} misses a run costing {r['avgMissS']:.0f} s on average")
+                    if r.get("directions"):
+                        eng.say(f"All runs by direction: {direction_text(r['directions'])}")
                 job["state"] = "done" if done else "stopped"
                 eng.say(("Run complete" if done else "Stopped") + f" ({time.time() - job['started']:.0f} s in all).")
             except Exception as e:                          # noqa: BLE001
