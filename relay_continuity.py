@@ -67,6 +67,14 @@ PACE = {                              # measured on RGAC2 -> SNBC, 28 Sep 2026
     "acq_margin_s": 1,
     "dis_otdr_s": 30,                 # v22: one long OTDR on each DIS fibre, for an accurate distance
     "outage_wait_s": 60,              # v22: FMS not answering: wait, then retry the same test
+    # Brunel 1.0.3 (16 Oct, R1 analysis): alternate ends in the straight pass. Fibre n tones at one
+    # end and is checked at the other; fibre n+1 the other way round. The next tone goes out the
+    # moment the far end refuses, on the RTU that is free, so no fibre waits for an old tone to run out.
+    # Each RTU's check waits for its own tone to end (one source per RTU), which also gives a slow
+    # FMS start a few seconds more. A dark straight go is retried from the other end.
+    "alt_tone_s": 10,                 # floor for the tone when alternating (offline: 12 s only added time)
+    "busy_retry_s": 1,                # OTDR refused because that RTU is still toning: retry this often
+    "busy_retries": 12,
     "outage_limit_s": 7200,           #      give up (run fails, resumable) after 2 h                # v20: acquisition must start at least this long before the tone ends              # v18: a dark result later than tone start + tone + this is rechecked
 }
 RELAY_VERSION = "Brunel 1.0"   # kept in step with main.py
@@ -155,6 +163,7 @@ class StartReq(BaseModel):
     fast: bool = True                 # Brunel: never step up to a long tone
     speedTest: bool = False           # Brunel: speed test, every fibre tried speedTries times, nothing recorded
     speedTries: int = PACE["speed_tries"]
+    alternate: bool = True            # Brunel 1.0.3: straight pass alternates which end tones
     wavelengthNm: int = 1550
     freqHz: int = 330
     simulate: str | None = None       # testing only; not offered in the app since v14
@@ -431,7 +440,8 @@ def make_router(valid_token, check_key, tone, live_tone: bool) -> APIRouter:
                "targets": len(targets), "started": time.time(), "ended": None, "rtuSeconds": 0.0,
                "error": "", "settings": req.model_dump(exclude={"prior"}), "engine": eng, "truthNotes": [],
                "pauseEvt": asyncio.Event(), "testLog": [],
-               "pace": {"toneS": req.toneS, "leadS": req.leadS, "auto": req.autoPace, "changes": []},
+               "pace": {"toneS": req.toneS, "leadS": req.leadS, "auto": req.autoPace, "changes": [],
+                        "alternate": bool(req.alternate and not req.speedTest)},
                "appVersion": req.appVersion, "resumeOf": req.resumeOf or "", "carried": len(eng.results),
                "locs": carried_locs, "user": req.user or "",
                "kind": "speed" if req.speedTest else "run", "speed": {}}
@@ -456,15 +466,47 @@ def make_router(valid_token, check_key, tone, live_tone: bool) -> APIRouter:
                 job["testLog"].append({"t": round(time.time(), 1), "src": src, "cand": cand, "verdict": r})
                 return r
         else:
-            tone_state = {"src": 0, "until": 0.0}
+            tstate: dict[str, dict] = {}                    # Brunel 1.0.3: tone state per RTU
+            straight_goes: dict[int, int] = {}              # goes so far on each fibre's own position
             missed = set()                                  # sources whose own fibre read clean once
             pace = job["pace"]
+            alt = pace["alternate"]
+
+            def ends(src, cand):
+                """(tone RTU, OTDR RTU) for this test. Cross searches always keep the run's direction."""
+                if not alt or cand != src:
+                    return req.toneRtu, req.testRtu
+                n = straight_goes.get(src, 0)
+                straight_goes[src] = n + 1
+                swap = (src % 2 == 0) != (n % 2 == 1)       # even fibres the other way; a retry swaps ends
+                return (req.testRtu, req.toneRtu) if swap else (req.toneRtu, req.testRtu)
+
+            async def own_tone_done(rtu):
+                """One source per RTU: an OTDR there waits for that RTU's own tone to end."""
+                ts = tstate.get(rtu)
+                if ts:
+                    w = ts["until"] + 0.3 - time.time()
+                    if w > 0:
+                        await asyncio.sleep(w)
+
+            async def otdr_when_free(rtu, name, comment):
+                res = await run_otdr(fms, rtu, name, req.otdrS, comment)
+                tries = 0
+                while alt and res["verdict"] == "start_refused" and not _is_outage(res.get("detail", "")) \
+                        and tries < PACE["busy_retries"]:
+                    tries += 1                              # still toning on our clock's edge: try again shortly
+                    await asyncio.sleep(PACE["busy_retry_s"])
+                    res = await run_otdr(fms, rtu, name, req.otdrS, comment)
+                if tries:
+                    res["busyRetries"] = tries
+                return res
 
             async def measure_dis(f):
                 """v22: one long OTDR on a DIS fibre for an accurate distance to its open end."""
                 name = f"{req.stem}-{ce.fname(f)}"
                 try:
                     eng.say(f"  {ce.fname(f)}: measuring where it stops ({PACE['dis_otdr_s']} s OTDR)")
+                    await own_tone_done(req.testRtu)
                     res = await run_otdr(fms, req.testRtu, name, PACE["dis_otdr_s"], f"continuity DIS distance {ce.fname(f)}")
                     job["testLog"].append({"t": round(time.time(), 1), "src": f, "cand": f, "verdict": "dis-" + res["verdict"],
                                            "otdrS": res.get("seconds"), "lenM": res.get("lenM"),
@@ -510,7 +552,8 @@ def make_router(valid_token, check_key, tone, live_tone: bool) -> APIRouter:
                                 if job["state"] == "stopped":
                                     return "error"
                                 await asyncio.sleep(1)
-                            tone_state["until"] = 0
+                            for ts in tstate.values():
+                                ts["until"] = 0
                 except RuntimeError:
                     raise
                 except Exception as e:                  # noqa: BLE001
@@ -528,17 +571,21 @@ def make_router(valid_token, check_key, tone, live_tone: bool) -> APIRouter:
                 cand_name = f"{req.stem}-{ce.fname(cand)}"
                 t0 = time.time()
                 tone_s, lead_s = pace["toneS"], pace["leadS"]
+                trtu, ortu = ends(src, cand)
+                if alt:
+                    tone_s = max(tone_s, PACE["alt_tone_s"])
                 # v15: the first test of a run and the retry of a fibre that missed get a long
                 # tone. Field runs: every miss so far followed a slow FMS start (cycle 36-66 s),
                 # so the extra cover goes where the risk is, not on every fibre.
                 if not req.fast and (long or not job["testLog"] or (cand == src and src in missed)):
                     tone_s = max(tone_s, PACE["cover_tone_s"])
                 need = max(1, min(13, tone_s - lead_s - 1))  # tone must still be on at the live check
-                if tone_state["src"] != src or tone_state["until"] - time.time() < need:
-                    wait = tone_state["until"] - time.time()
+                ts = tstate.setdefault(trtu, {"src": 0, "until": 0.0})
+                if ts["src"] != src or ts["until"] - time.time() < need:
+                    wait = ts["until"] - time.time()
                     if wait > 0:                            # one source per RTU
                         await asyncio.sleep(wait + 0.5)
-                    node = ROUTES[req.toneRtu].get(src_name.upper())
+                    node = ROUTES[trtu].get(src_name.upper())
                     try:
                         t = await tone(x_session, src_name, str(node["rtuId"]),
                                        req.wavelengthNm, tone_s, req.freqHz, str(node["id"]))
@@ -550,10 +597,10 @@ def make_router(valid_token, check_key, tone, live_tone: bool) -> APIRouter:
                         return "error"
                     if t.get("simulated"):
                         raise RuntimeError("Relay tone is simulated (LIVE_TONE=0)")
-                    tone_state.update(src=src, until=time.time() + tone_s, start=time.time(), len=tone_s)
+                    ts.update(src=src, until=time.time() + tone_s, start=time.time(), len=tone_s)
                     await asyncio.sleep(lead_s)
-                res = await run_otdr(fms, req.testRtu, cand_name, req.otdrS,
-                                     f"continuity {ce.fname(src)} to {ce.fname(cand)}")
+                await own_tone_done(ortu)
+                res = await otdr_when_free(ortu, cand_name, f"continuity {ce.fname(src)} to {ce.fname(cand)}")
                 job["rtuSeconds"] += res.get("seconds", 0)
                 v = res["verdict"]
                 # v22: an OTDR that hangs, gives no output, or a 5xx on start is FMS failing, not a fibre result
@@ -568,28 +615,30 @@ def make_router(valid_token, check_key, tone, live_tone: bool) -> APIRouter:
                 # FMS sometimes starts late; then the tone has ended and "clean" proves nothing.
                 # v20: judge by when FMS started the acquisition (from its task times), not by when
                 # the result came back. A dark OTDR that is merely slow to finish is fine.
-                tone_end = tone_state.get("start", t0) + tone_state.get("len", tone_s)
+                tone_end = ts.get("start", t0) + ts.get("len", tone_s)
                 acq = res.get("acqStart")
                 if acq:
                     late = acq > tone_end - PACE["acq_margin_s"]
                 else:
-                    late = time.time() - tone_state.get("start", t0) > tone_state.get("len", tone_s) + PACE["late_margin_s"]
+                    late = time.time() - ts.get("start", t0) > ts.get("len", tone_s) + PACE["late_margin_s"]
                 if v == "clean" and late and not recheck:
                     job["testLog"].append({"t": round(t0, 1), "src": src, "cand": cand, "verdict": "late",
                                            "otdrS": res.get("seconds"), "cycleS": round(time.time() - t0, 1),
                                            "toneS": tone_s, "leadS": lead_s, "workflow": res.get("workflowId", ""),
+                                           "toneAt": trtu, "otdrAt": ortu,
                                            "detail": "dark after a late FMS start, rechecking with a long tone"})
                     job["lateRechecks"] = job.get("lateRechecks", 0) + 1
                     eng.say(f"  {ce.fname(src)} on {ce.fname(cand)}: dark but FMS started late "
                             f"({round(time.time() - t0)} s), rechecking"
                             + ("" if req.fast else f" with a {PACE['cover_tone_s']} s tone"))
-                    tone_state["until"] = 0                 # force a fresh tone
+                    ts["src"] = 0                           # force a fresh tone (it waits for the old one)
                     return await test_once(src, cand, True, True)
                 job["testLog"].append({"t": round(t0, 1), "src": src, "cand": cand, "verdict": v,
                                        "otdrS": res.get("seconds"), "cycleS": round(time.time() - t0, 1),
                                        "toneS": tone_s, "leadS": lead_s, "workflow": res.get("workflowId", ""),
                                        "lenM": res.get("lenM"), "via": res.get("via"),
-                                       "acqAfterToneS": (round(res["acqStart"] - tone_state.get("start", t0), 1)
+                                       "toneAt": trtu, "otdrAt": ortu, "busyRetries": res.get("busyRetries", 0),
+                                       "acqAfterToneS": (round(res["acqStart"] - ts.get("start", t0), 1)
                                                          if res.get("acqStart") else None),
                                        "timeline": res.get("timeline", [])[:8] if len(job["testLog"]) < 60 else [],
                                        "detail": ("" if v in ("clash", "clean") else res.get("detail", "")[:300])})
@@ -682,7 +731,7 @@ def make_router(valid_token, check_key, tone, live_tone: bool) -> APIRouter:
         out.update(kind=job.get("kind", "run"))
         if job.get("kind") == "speed":
             out["speed"] = speed_summary(job)
-        out.update(pace={k: job["pace"][k] for k in ("toneS", "leadS", "auto")},
+        out.update(pace={k: job["pace"].get(k) for k in ("toneS", "leadS", "auto", "alternate")},
                    appVersion=job.get("appVersion", ""), relayVersion=RELAY_VERSION)
         out.update(done=len(res), counts=counts, tests=eng.tests, rtuSeconds=round(job["rtuSeconds"]),
                    current=eng.current, candidate=eng.candidate, now=time.time(),
