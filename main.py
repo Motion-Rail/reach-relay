@@ -55,7 +55,7 @@ PAGE_SIZE   = int(os.getenv("PAGE_SIZE", "50"))
 # Brunel (9 Oct 2026): releases are named after great railway engineers, in this order:
 # Brunel, Stephenson, Telford, Gresley, Locke, Fowler, Hackworth, Trevithick, Churchward, Stanier.
 # A minor update adds .1, .2 (Brunel.1). RELAY_BUILD keeps counting up for checks.
-RELAY_VERSION = "Brunel 1.0"
+RELAY_VERSION = "Brunel 1.0.4"   # bump on every relay change (Alkis, 16 Oct): the app shows this
 RELAY_BUILD = 47
 
 # ── relay access ─────────────────────────────────────────────────────────────
@@ -550,6 +550,8 @@ async def tone(body: ToneIn, x_app_key: str | None = Header(default=None),
 
 # ── v12: RTU to RTU continuity (see relay_continuity.py) ────────────────────────
 from relay_continuity import make_router as _continuity_router
+import relay_continuity as _rc
+_rc.RELAY_VERSION = RELAY_VERSION          # one version string for /health and run status
 
 async def _continuity_tone(sid, fibre, rtu_id, wl, dur, hz, route_id=None):
     """Reuse the /api/tone logic exactly, including the 409 back-off. v15: the continuity

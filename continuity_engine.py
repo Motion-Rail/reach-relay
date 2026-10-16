@@ -91,6 +91,14 @@ class Engine:
     dark_ribbons: list = field(default_factory=list)   # v26: ribbons with no light at all
     flipped_ribbons: list = field(default_factory=list)  # Brunel.4: ribbons declared flipped (1 to 12)
     no_flip: set = field(default_factory=set)            # Brunel.4: fibres already shown not to be on their mirror
+    mark: float = 0.0                                    # Brunel 1.0.4: start of the current fibre, for "(X s)" in the log
+
+    def lap(self) -> float:
+        """Seconds since the last fibre line, and start timing the next one."""
+        now = time.time()
+        dt = now - (self.mark or now)
+        self.mark = now
+        return dt
 
     def say(self, msg: str):
         self.log.append(time.strftime("%H:%M:%S ") + msg)
@@ -224,18 +232,19 @@ class Engine:
             self.used_far.add(res.found)
         res.why += suffix
         self.results[f] = res
+        took = f" ({self.lap():.1f} s)"
         if res.state == "straight":
-            self.say(f"{fname(f)} {rplabel(f)} straight, {res.tests} test{'s' if res.tests != 1 else ''}")
+            self.say(f"{fname(f)} {rplabel(f)} straight, {res.tests} test{'s' if res.tests != 1 else ''}{took}")
         elif res.state == "cross":
-            self.say(f"{fname(f)} {rplabel(f)} CROSS to {fname(res.found)} {rplabel(res.found)} ({res.why})")
+            self.say(f"{fname(f)} {rplabel(f)} CROSS to {fname(res.found)} {rplabel(res.found)} ({res.why}){took}")
             if self.opts.learn:
                 self.learn_from(f, res.found)
         elif res.state == "flip":
-            self.say(f"{fname(f)} {rplabel(f)} FLIPPED, lands on {fname(res.found)} {rplabel(res.found)}")
+            self.say(f"{fname(f)} {rplabel(f)} FLIPPED, lands on {fname(res.found)} {rplabel(res.found)}{took}")
         elif res.state == "dis":
-            self.say(f"{fname(f)} {rplabel(f)} DIS, {res.why} ({res.tests} tests)")
+            self.say(f"{fname(f)} {rplabel(f)} DIS, {res.why} ({res.tests} tests){took}")
         else:
-            self.say(f"{fname(f)} {rplabel(f)} NOT FOUND after {res.tests} tests")
+            self.say(f"{fname(f)} {rplabel(f)} NOT FOUND after {res.tests} tests{took}")
         self.hyp = [h for h in self.hyp if h.miss < 3]
 
     # ---- v18: ribbon by ribbon, physical fault logic ----
@@ -543,7 +552,7 @@ class Engine:
                 self.record(f, Result("straight", f, counts[f], "expected"))
             else:
                 pending.append(f)
-                self.say(f"  {fname(f)} {rplabel(f)} dark on its own position, will search after the ribbon")
+                self.say(f"  {fname(f)} {rplabel(f)} dark on its own position, will search after the ribbon ({self.lap():.1f} s)")
                 # Brunel.4: the first dark fibre with nothing straight yet: is the ribbon flipped (f1 on f12)?
                 if flip_checks < 2 and not any(self.results.get(x) and self.results[x].state == "straight" for x in fibres):
                     flip_checks += 1
@@ -662,6 +671,7 @@ class Engine:
 
     async def run(self, targets: list[int], test, control) -> bool:
         """Returns False if stopped."""
+        self.mark = time.time()
         tset = set(targets)
         ribbons: dict[int, list[int]] = {}
         for f in targets:
