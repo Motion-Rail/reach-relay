@@ -55,8 +55,8 @@ PAGE_SIZE   = int(os.getenv("PAGE_SIZE", "50"))
 # Brunel (9 Oct 2026): releases are named after great railway engineers, in this order:
 # Brunel, Stephenson, Telford, Gresley, Locke, Fowler, Hackworth, Trevithick, Churchward, Stanier.
 # A minor update adds .1, .2 (Brunel.1). RELAY_BUILD keeps counting up for checks.
-RELAY_VERSION = "Brunel 1.0.5"   # bump on every relay change (Alkis, 16 Oct): the app shows this
-RELAY_BUILD = 47
+RELAY_VERSION = "Brunel 1.1"   # bump on every relay change (Alkis, 16 Oct): the app shows this
+RELAY_BUILD = 48
 
 # ── relay access ─────────────────────────────────────────────────────────────
 APP_KEY    = os.getenv("APP_KEY", "")
@@ -598,6 +598,10 @@ app.include_router(_fullreport_router(_valid_token, _check_key, SESSIONS))
 # ── Brunel 1.0: learned locations and the asset inventory per cable (see relay_assets.py) ──
 from relay_assets import make_router as _assets_router
 app.include_router(_assets_router(_valid_token, _check_key, SESSIONS))
+
+# ── Brunel 1.1: Splice loss view in Cable View (Cable Insight engine, see relay_splice.py) ──
+from relay_splice import make_router as _splice_router
+app.include_router(_splice_router(_valid_token, _check_key, SESSIONS))
 
 # ── Brunel.6: admin security endpoints (sign out everywhere, status) ──
 app.include_router(sec.make_router(_check_key, SESSIONS, _logout_fms))
