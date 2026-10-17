@@ -16,6 +16,7 @@ kept). A splice seen from one end only follows the "one end only" setting:
   exclude  left out of Warn+ and listed as one way only
 Filled values are always marked.
 """
+import gzip
 import hashlib
 import json
 import os
@@ -34,6 +35,11 @@ SPLICE_TYPES = ("Splice", "Group")
 END_MARGIN_M = 100.0
 MATCH_TOL_M = 30.0
 DIST_OVERRIDE = None        # a Distances workbook to use instead of the one next to fms_pull (the relay)
+LEARNED_FOR = None          # cable -> learned locations [{"name","distance_m","tolerance_m","type"}] (the relay)
+NAMES_SAVED = None          # (section, names) -> called after a joint is named, so the relay can keep a copy
+SNAPS_SAVED = None          # (section, snapshots) -> called after a snapshot is saved or removed (the relay keeps a copy)
+ODF_KINDS = ("ODF", "S-ODF", "SODF", "NODF", "REB")
+JOINT_TYPES = ["Joint", "Temp joint", "Spur joint", "ODF", "S-ODF", "REB", "Other"]
 FIBRES_PER_RIBBON = 12
 DEFAULT_SETTINGS = {"one_end": "nominal", "nominal": 0.02, "threshold": 0.15, "split": False,
                     "sodf_limit": 0.30, "nr_ribbons": "1-18", "spur_gap": 1500, "group_tol": 100,
@@ -53,7 +59,7 @@ CREATE TABLE IF NOT EXISTS events(
   ab REAL, ba REAL, dirs INTEGER, loc TEXT, bpos REAL, spur_d REAL, spur_len REAL);
 CREATE TABLE IF NOT EXISTS locations(
   ds INTEGER, loc TEXT, ord INTEGER, pos REAL, kind TEXT, n_fibres INTEGER,
-  scheduled INTEGER, spur_d REAL, spur_len REAL);
+  scheduled INTEGER, spur_d REAL, spur_len REAL, was TEXT);
 CREATE TABLE IF NOT EXISTS odf(
   ds INTEGER, fno INTEGER, ribbon INTEGER, end_ TEXT, pos REAL, type TEXT,
   refl REAL, w1310 REAL, w1550 REAL, w1625 REAL, sw REAL);
@@ -255,15 +261,14 @@ def load_fms_pull(fms_dir):
     return fms_pull
 
 
-def name_locations(events, cable, site_a, fms_dir, log=print):
-    """Give each mid-route event its location name using fms_pull's own matching."""
+def name_locations(events, cable, site_a, fms_dir, log=print, lengths=None):
+    """Give each mid-route event its location name using fms_pull's own matching, or, for a
+    cable with no Distances schedule, from the joints most of the cable shares (named from
+    the app's learned locations where they match)."""
     fp = load_fms_pull(fms_dir)
-    if fp is None:
-        log("  fms_pull not found: locations are grouped by distance only")
-        return _cluster_only(events), {}
-    dist = DIST_OVERRIDE or os.path.join(fms_dir, "Distances.xlsx")
     schedule, label, kinds = [], "none", {}
-    if os.path.exists(dist):
+    dist = DIST_OVERRIDE or os.path.join(fms_dir or "", "Distances.xlsx")
+    if fp is not None and os.path.exists(dist):
         sheet, _ = fp.pick_sheet_for_cable(dist, cable, site=site_a, verbose=False)
         if sheet:
             schedule = fp.load_locations(dist, sheet, verbose=False)
@@ -271,27 +276,29 @@ def name_locations(events, cable, site_a, fms_dir, log=print):
             label = f"Distances.xlsx / {sheet}"
     if schedule:
         fp.map_locations(events, schedule, tol=120.0, verbose=False)
-    fp.label_unmapped(events, tol=25.0, min_fibres=3, verbose=False)
+        fp.label_unmapped(events, tol=25.0, min_fibres=3, verbose=False)
+    else:
+        label, kinds = found_locations(events, cable, lengths)
     log(f"  locations named from {label}")
     return label, kinds
 
 
-def _cluster_only(events):
-    pts = sorted(e["position"] for e in events)
-    if not pts:
-        return "distance only"
-    run, centres = [pts[0]], []
-    for p in pts[1:]:
-        if p - run[-1] <= 25.0:
-            run.append(p)
-        else:
-            centres.append(sum(run) / len(run)); run = [p]
-    centres.append(sum(run) / len(run))
+def found_locations(events, cable, lengths):
+    learned = None
+    if LEARNED_FOR:
+        try:
+            learned = LEARNED_FOR(cable)
+        except Exception:                   # noqa: BLE001
+            learned = None
     for e in events:
-        c = round(min(centres, key=lambda x: abs(x - e["position"])))
-        e["location"] = f"{c:,} m (unscheduled)"
-        e["unscheduled"] = True
-    return "distance only"
+        e["location"] = None
+        e.pop("unscheduled", None)
+    res = ci_align.find_backbone(events, lengths, learned)
+    if learned:
+        label = f"learned locations ({res['learned']} of {len(res['names'])} joints named)"
+    else:
+        label = f"joints found from the results ({len(res['names'])})"
+    return label, res["kinds"]
 
 
 # --------------------------------------------------------------------------- backbone
@@ -301,9 +308,10 @@ def _is_mid(e, cable_len):
             and e.get("type") in ("Splice", "Group", "Connector", "Macrobend"))
 
 
-def _align_mid(mid, scheduled):
-    """Backbone distance for every mid route event, then the unscheduled joints clustered on it."""
-    res = ci_align.align(mid, scheduled)
+def _align_mid(mid, scheduled, found=False):
+    """Backbone distance for every mid route event, then the unscheduled joints clustered on it.
+    found: no Distances schedule, so spur loops are placed from the ribbons' own unnamed joints."""
+    res = ci_align.align(mid, scheduled, loose_loops=found)
     ci_align.label_loose(mid, scheduled)
     return res
 
@@ -332,6 +340,128 @@ def _insert_locations(con, ds, mid, kinds):
          0 if any(x.get("unscheduled") for x in xs) else 1, sd, sl)
         for i, (k, pos, sd, sl, xs) in enumerate(rows)])
     return len(rows)
+
+
+# --------------------------------------------------------------------------- app names
+NAME_POS_M = 25.0           # a named joint and a joint in a later test are the same within this
+NAME_SPUR_M = 15.0          # and, on a spur, within this along the spur
+
+
+def _renameable(loc_row):
+    loc = str(loc_row["loc"])
+    return loc_row["scheduled"] != 1 or loc.startswith("Unnamed ")
+
+
+def _find_name(names, row):
+    """The saved name for a location row, matched by place."""
+    best = None
+    for n in names:
+        if (n.get("spur_d") is None) != (row.get("spur_d") is None):
+            continue
+        gap = abs(n["bpos"] - row["pos"])
+        if gap > NAME_POS_M:
+            continue
+        if n.get("spur_d") is not None and abs(n["spur_d"] - row["spur_d"]) > NAME_SPUR_M:
+            continue
+        if best is None or gap < best[0]:
+            best = (gap, n)
+    return best[1] if best else None
+
+
+def apply_names(con, ds, names):
+    """Give the joints of one pull the names saved in the app, by place. Returns how many."""
+    if not names:
+        return 0
+    rows = [dict(r) for r in con.execute("SELECT * FROM locations WHERE ds=?", (ds,))]
+    taken = {r["loc"] for r in rows}
+    done = 0
+    for n in names:
+        cands = [r for r in rows if _renameable(r) and _find_name([n], r) is n]
+        if not cands:
+            continue
+        r = min(cands, key=lambda x: abs(x["pos"] - n["bpos"]))
+        if r["loc"] == n["name"]:
+            con.execute("UPDATE locations SET kind=? WHERE ds=? AND loc=?", (n.get("type") or "", ds, r["loc"]))
+            continue
+        if n["name"] in taken:
+            continue
+        con.execute("UPDATE events SET loc=? WHERE ds=? AND loc=?", (n["name"], ds, r["loc"]))
+        con.execute("UPDATE locations SET loc=?, kind=?, scheduled=2, was=COALESCE(was, ?) WHERE ds=? AND loc=?",
+                    (n["name"], n.get("type") or "", r["loc"], ds, r["loc"]))
+        taken.discard(r["loc"]); taken.add(n["name"])
+        r["loc"] = n["name"]
+        done += 1
+    return done
+
+
+def _unname(con, ds, name):
+    r = con.execute("SELECT was FROM locations WHERE ds=? AND loc=? AND scheduled=2", (ds, name)).fetchone()
+    if not r or not r[0]:
+        return
+    was = r[0]
+    con.execute("UPDATE events SET loc=? WHERE ds=? AND loc=?", (was, ds, name))
+    con.execute("UPDATE locations SET loc=?, kind='', scheduled=?, was=NULL WHERE ds=? AND loc=?",
+                (was, 1 if was.startswith("Unnamed ") else 0, ds, name))
+
+
+TRACK_STATUS = ("new", "back", "still", "fixed", "not_seen")
+
+
+def _track_status(seq, order):
+    """What happened to one splice over the tests (True fail, False pass, None not read), and since
+    which test: new (passed before, fails now), back (failed, passed, fails again), still (fails in
+    every test it was read in), fixed (failed, passes now), not_seen (no reading in the latest test)."""
+    if seq[-1] is None:
+        last = max(i for i, x in enumerate(seq) if x is not None)
+        return "not_seen", order[last]
+    run = len(seq) - 1                      # start of the latest unbroken run of the same result
+    while run > 0 and (seq[run - 1] == seq[-1] or seq[run - 1] is None):
+        run -= 1
+    while seq[run] is None:
+        run += 1
+    before = [x for x in seq[:run] if x is not None]
+    if seq[-1]:
+        if not before:
+            return "still", order[run]
+        return ("back" if any(before) else "new"), order[run]
+    return "fixed", order[run]
+
+
+def _is_odf_loc(l):
+    k = re.sub(r"[^A-Z]", "", str(l.get("kind") or "").upper())
+    return k in {re.sub(r"[^A-Z]", "", x) for x in ODF_KINDS} or bool(re.search(r"\b(REB|ODF)\b", str(l.get("loc") or "").upper()))
+
+
+def _lj(l):
+    return {"loc": l["loc"], "pos": round(l["pos"], 1), "spur": l.get("spur"), "n_fibres": len(l.get("fnos") or ())}
+
+
+def _is_named(l):
+    loc = str(l.get("loc") or "")
+    return not ("(unscheduled)" in loc or loc.startswith("Unnamed ") or loc.startswith("Spur at "))
+
+
+def _trend_joint(joints, l, used=()):
+    """The joint already in the trend that this pull's location is: same name, or for unnamed
+    joints the same place (and the same place on its spur)."""
+    best = None
+    for j in joints:
+        if j["loc"] == l["loc"]:
+            return j
+        if id(j) in used:
+            continue                        # one location of a pull per joint
+        if (j["spur_d"] is None) != (l.get("spur_d") is None):
+            continue
+        if _is_named(l) and j["named"]:
+            continue
+        gap = abs(j["pos"] - l["pos"])
+        if gap > NAME_POS_M:
+            continue
+        if j["spur_d"] is not None and abs(j["spur_d"] - l["spur_d"]) > NAME_SPUR_M:
+            continue
+        if best is None or gap < best[0]:
+            best = (gap, j)
+    return best[1] if best else None
 
 
 # --------------------------------------------------------------------------- store
@@ -376,6 +506,8 @@ class Store:
             for c in add:
                 if c not in have:
                     con.execute(f"ALTER TABLE {tbl} ADD COLUMN {c} REAL")
+        if "was" not in {r[1] for r in con.execute("PRAGMA table_info(locations)")}:
+            con.execute("ALTER TABLE locations ADD COLUMN was TEXT")
         # upgrade pulls stored by v0.1: fingerprint them and give them the new names
         for d in con.execute("SELECT id, label, t_from, t_to FROM datasets WHERE content_sig IS NULL").fetchall():
             rows = con.execute("SELECT fno, date_a, date_b FROM fibres WHERE ds=?", (d["id"],)).fetchall()
@@ -400,22 +532,97 @@ class Store:
         lens = [r[0] for r in con.execute("SELECT len_a FROM fibres WHERE ds=? AND len_a", (ds,))]
         cable_len = statistics.median(lens) if lens else None
         locs = {r["loc"]: dict(r) for r in con.execute("SELECT * FROM locations WHERE ds=?", (ds,))}
-        sched = {k for k, v in locs.items() if v["scheduled"]}
+        sched = {k for k, v in locs.items() if v["scheduled"] == 1}       # 2: named in the app, matched again by place
+        info = con.execute("SELECT cable, schedule, section FROM datasets WHERE id=?", (ds,)).fetchone()
+        own = str(info["schedule"] or "").startswith("Distances")
         evs = []
-        for r in con.execute("SELECT rowid, fno, pos, type, loc FROM events WHERE ds=?", (ds,)):
+        for r in con.execute("SELECT rowid, fno, pos, type, loc FROM events WHERE ds=? ORDER BY rowid", (ds,)):
             evs.append({"rowid": r["rowid"], "fno": r["fno"], "position": r["pos"], "type": r["type"],
                         "location": r["loc"] if r["loc"] in sched else None, "loc_was": r["loc"]})
         mid = [e for e in evs if _is_mid(e, cable_len)]
-        _align_mid(mid, sched)
+        kinds = {k: v["kind"] for k, v in locs.items()}
+        if not own:
+            # no Distances schedule: the shared joints are found (and named from learned locations)
+            lens_by = {r[0]: r[1] or r[2] for r in con.execute("SELECT fno, len_a, len_b FROM fibres WHERE ds=?", (ds,))}
+            label, kinds = found_locations(mid, info["cable"], lens_by)
+            sched = {e["location"] for e in mid if e.get("location")}
+            con.execute("UPDATE datasets SET schedule=? WHERE id=?", (label, ds))
+        _align_mid(mid, sched, found=not own)
         for e in evs:
             if "bpos" not in e:
                 e.update(bpos=e["position"], spur_d=None, spur_len=None, location=e["loc_was"])
         con.executemany("UPDATE events SET loc=?, bpos=?, spur_d=?, spur_len=? WHERE rowid=?",
                         [(e["location"], e["bpos"], e["spur_d"], e["spur_len"], e["rowid"]) for e in evs])
         con.execute("DELETE FROM locations WHERE ds=?", (ds,))
-        _insert_locations(con, ds, mid, {k: v["kind"] for k, v in locs.items()})
+        _insert_locations(con, ds, mid, kinds)
+        apply_names(con, ds, self.names(info["section"]))
         con.execute("UPDATE datasets SET align=? WHERE id=?", (ci_align.ALIGN_V, ds))
         con.commit()
+
+    # ---------------------------------------------------------------- names given in the app
+    def names(self, section):
+        """Joints named in the app for this cable: [{"name","type","bpos","spur_d","spur_len","by","at"}].
+        Each is matched by place (backbone distance, and place on its spur), so every later test,
+        and every pull already stored, takes the name."""
+        if not section:
+            return []
+        try:
+            with open(os.path.join(self.folder(section), "names.json"), encoding="utf-8") as fh:
+                got = json.load(fh)
+            return [n for n in got.get("names", []) if n.get("name") and n.get("bpos") is not None]
+        except (OSError, ValueError):
+            return []
+
+    def save_names(self, section, names):
+        os.makedirs(self.folder(section), exist_ok=True)
+        path = os.path.join(self.folder(section), "names.json")
+        tmp = path + ".tmp"
+        with open(tmp, "w", encoding="utf-8") as fh:
+            json.dump({"names": names}, fh, indent=1)
+        os.replace(tmp, path)
+        if NAMES_SAVED:
+            try:
+                NAMES_SAVED(section, names)
+            except Exception:               # noqa: BLE001
+                pass
+
+    def set_name(self, section, ds, loc, name, typ="", by=""):
+        """Name a joint (or rename one named in the app); an empty name takes the name off.
+        Joints named by the Distances schedule are not changed here."""
+        con = self.db(section)
+        row = con.execute("SELECT * FROM locations WHERE ds=? AND loc=?", (ds, loc)).fetchone()
+        if not row:
+            raise KeyError("No such joint in this pull")
+        row = dict(row)
+        if row["scheduled"] == 1 and not str(loc).startswith("Unnamed "):
+            raise ValueError("This joint is named by the Distances schedule")
+        name = " ".join(str(name or "").split())[:60]
+        typ = typ if typ in JOINT_TYPES else ""
+        names = self.names(section)
+        here = _find_name(names, row)
+        if name:
+            clash = next((n for n in names if n["name"].lower() == name.lower() and n is not here), None)
+            if clash or any(r[0].lower() == name.lower() and r[0] != loc for r in
+                            con.execute("SELECT loc FROM locations WHERE ds=? AND scheduled=1", (ds,))):
+                raise ValueError(f"{name} is already used on this cable")
+            entry = {"name": name, "type": typ, "bpos": round(row["pos"], 1),
+                     "spur_d": None if row["spur_d"] is None else round(row["spur_d"], 1),
+                     "spur_len": None if row["spur_len"] is None else round(row["spur_len"], 1),
+                     "by": by, "at": time.strftime("%Y-%m-%d %H:%M")}
+            if here:
+                names[names.index(here)] = entry
+            else:
+                names.append(entry)
+        elif here:
+            names.remove(here)
+        names.sort(key=lambda n: (n["bpos"], -1 if n["spur_d"] is None else n["spur_d"]))
+        self.save_names(section, names)
+        for d in [r[0] for r in con.execute("SELECT id FROM datasets")]:
+            if not name and here:
+                _unname(con, d, here["name"])
+            apply_names(con, d, names)
+        con.commit()
+        return {"names": names, "name": name or None}
 
     def find_same(self, section, sig):
         if not os.path.exists(os.path.join(self.folder(section), "store.sqlite")):
@@ -452,8 +659,11 @@ class Store:
         lens = [v["len"] for v in data["rawA"].values() if v.get("len")]
         cable_len = statistics.median(lens) if lens else None
         mid = [e for e in data["events"] if _is_mid(e, cable_len)]
-        schedule, kinds = name_locations(mid, data["cable"], data["site_a"], fms_dir, log=log)
-        res = _align_mid(mid, {e["location"] for e in mid if e.get("location") and not e.get("unscheduled")})
+        lens_by = {n: (data["rawA"].get(n) or {}).get("len") or (data["rawB"].get(n) or {}).get("len")
+                   for n in set(data["rawA"]) | set(data["rawB"])}
+        schedule, kinds = name_locations(mid, data["cable"], data["site_a"], fms_dir, log=log, lengths=lens_by)
+        res = _align_mid(mid, {e["location"] for e in mid if e.get("location") and not e.get("unscheduled")},
+                         found=not schedule.startswith("Distances"))
         log(f"  backbone: {res['anchors']} shared joints, spur loops on {res['loops']} ribbon stretches")
         label = label or tested_label(data["t_from"], data["t_to"])
         cur = con.execute(
@@ -482,6 +692,9 @@ class Store:
              e["dirs"], e.get("location"), e.get("bpos", e["position"]), e.get("spur_d"), e.get("spur_len"))
             for e in data["events"]])
         n_locs = _insert_locations(con, ds, mid, kinds)
+        named = apply_names(con, ds, self.names(section))
+        if named:
+            log(f"  {named} joints named in the app")
         con.commit()
         log(f"  stored: {len(rows)} fibres, {len(data['events'])} events, {n_locs} locations")
         return ds
@@ -828,6 +1041,267 @@ class Store:
                 "group": group if gsel else None,
                 "spurs": [sp["name"] for sp in ann["spurs"]]}
 
+    # ---------------------------------------------------------------- history: pulls kept over time
+    TABLES = ("fibres", "events", "locations", "odf")
+
+    def export_pull(self, section, ds):
+        """One pull as a small gzip JSON, to keep it beyond the work folder (the relay's log repo).
+        The results themselves (both ends, every event) go with it, so it can be judged again with
+        any settings and compared with any other pull."""
+        con = self.db(section)
+        d = con.execute("SELECT * FROM datasets WHERE id=?", (ds,)).fetchone()
+        if not d:
+            raise KeyError("dataset")
+        out = {"v": 1, "dataset": {k: d[k] for k in d.keys() if k != "id"}}
+        for t in self.TABLES:
+            cols = [r[1] for r in con.execute(f"PRAGMA table_info({t})") if r[1] != "ds"]
+            out[t] = {"cols": cols, "rows": [list(r) for r in con.execute(
+                f"SELECT {','.join(cols)} FROM {t} WHERE ds=?", (ds,))]}
+        return gzip.compress(json.dumps(out, separators=(",", ":")).encode("utf-8"))
+
+    def import_pull(self, section, blob):
+        """A pull kept earlier, back into the store. Returns its new id, or None when the same
+        results are already here."""
+        data = json.loads(gzip.decompress(blob).decode("utf-8"))
+        d = data["dataset"]
+        con = self.db(section)
+        if d.get("content_sig") and con.execute("SELECT 1 FROM datasets WHERE content_sig=?", (d["content_sig"],)).fetchone():
+            return None
+        have = {r[1] for r in con.execute("PRAGMA table_info(datasets)")} - {"id"}
+        keys = [k for k in d if k in have]
+        cur = con.execute(f"INSERT INTO datasets({','.join(keys)}) VALUES({','.join('?' * len(keys))})",
+                          [d[k] for k in keys])
+        ds = cur.lastrowid
+        for t in self.TABLES:
+            part = data.get(t) or {}
+            cols = part.get("cols") or []
+            tcols = {r[1] for r in con.execute(f"PRAGMA table_info({t})")}
+            use = [i for i, c in enumerate(cols) if c in tcols]
+            if not use:
+                continue
+            names = ["ds"] + [cols[i] for i in use]
+            con.executemany(f"INSERT INTO {t}({','.join(names)}) VALUES({','.join('?' * len(names))})",
+                            [[ds] + [r[i] for i in use] for r in part.get("rows") or []])
+        con.commit()
+        con.close()
+        self.db(section).close()                 # realigns it when it was kept by an older version
+        return ds
+
+    # ---------------------------------------------------------------- snapshots: checked tests
+    def snapshots(self, section):
+        """Tests that have been checked and saved as snapshots, each with the pass/fail criteria it was
+        saved with (EXFO style), keyed by the test's content signature so they survive a rebuild."""
+        try:
+            with open(os.path.join(self.folder(section), "snapshots.json"), encoding="utf-8") as fh:
+                return [x for x in json.load(fh).get("snapshots", []) if x.get("sig")]
+        except (OSError, ValueError):
+            return []
+
+    def save_snapshots(self, section, snaps):
+        os.makedirs(self.folder(section), exist_ok=True)
+        path = os.path.join(self.folder(section), "snapshots.json")
+        with open(path + ".tmp", "w", encoding="utf-8") as fh:
+            json.dump({"snapshots": snaps}, fh, indent=1)
+        os.replace(path + ".tmp", path)
+        if SNAPS_SAVED:
+            try:
+                SNAPS_SAVED(section, snaps)
+            except Exception:               # noqa: BLE001
+                pass
+
+    def snapshot_of(self, section, ds):
+        d = next((x for x in self.datasets(section) if x["id"] == ds), None)
+        if not d:
+            return None
+        return next((x for x in self.snapshots(section) if x["sig"] == d.get("content_sig")), None)
+
+    def lineup(self, section, base, new, st):
+        """Does one test line up with another before they are compared: the same joints at the same
+        places. Joints are matched by name, or by place when unnamed; small clusters are left out."""
+        a, b = self.analysis(section, base, st), self.analysis(section, new, st)
+        def big(an):
+            n = max(3, round(0.05 * len(an["fibres"])))
+            return [l for l in an["locs"] if _is_named(l) or len(l["fnos"]) >= n]
+        la, lb = big(a), big(b)
+        joints = []
+        for l in la:
+            joints.append({"loc": l["loc"], "pos": l["pos"], "spur_d": l.get("spur_d"), "named": _is_named(l),
+                           "a": l, "b": None})
+        matched, moved, only_new = 0, [], []
+        used = set()
+        for l in lb:
+            j = _trend_joint([x for x in joints if x["b"] is None], l, used)
+            if j is None:
+                only_new.append(_lj(l)); continue
+            j["b"] = l; used.add(id(j)); matched += 1
+            shift = l["pos"] - j["pos"]
+            if abs(shift) > 10 or (j["loc"] != l["loc"] and _is_named(l) and j["named"]):
+                moved.append({"before": j["loc"], "now": l["loc"], "pos_before": round(j["pos"], 1),
+                              "pos_now": round(l["pos"], 1), "shift_m": round(shift, 1)})
+        only_prev = [_lj(j["a"]) for j in joints if j["b"] is None]
+        return {"base": base, "new": new, "matched": matched, "moved": moved, "only_before": only_prev,
+                "only_now": only_new, "ok": not moved and not only_prev and not only_new}
+
+    def review(self, section, ds, st):
+        """Everything to check before a test is saved as a snapshot: the ODF at each end, the ODFs along
+        the route, the joints and spurs found, the pass/fail criteria, and how it lines up with the
+        snapshot before it."""
+        info = next((x for x in self.datasets(section) if x["id"] == ds), None)
+        if not info:
+            raise KeyError("dataset")
+        an = self.analysis(section, ds, st)
+        od = self.odf(section, ds, st)
+        ends = {}
+        for end, site in (("A", od.get("site_a")), ("B", od.get("site_b"))):
+            pos = sorted(f[end]["pos"] for f in od["fibres"] if f.get(end) and f[end].get("pos") is not None)
+            ends[end] = {"site": site or ("End " + end), "read": od["counts"][end]["tested"],
+                         "none": od["counts"][end]["none"], "fail": od["counts"][end]["fail"],
+                         "median": od["counts"][end]["median"], "worst": od["counts"][end]["worst"],
+                         "pos_m": round(pos[len(pos) // 2], 1) if pos else None}
+        nmin = max(3, round(0.05 * len(an["fibres"])))
+        route = [{"loc": l["loc"], "pos": l["pos"], "kind": l.get("kind") or "", "spur": l.get("spur"),
+                  "spur_leg": l.get("spur_leg"), "spur_m": l.get("spur_m"), "n_fibres": len(l["fnos"]),
+                  "named": _is_named(l), "scheduled": l.get("scheduled")}
+                 for l in an["locs"] if _is_odf_loc(l)]
+        far = []                            # unnamed spur ends that are probably the REB ODF
+        for sp in an["spurs"]:
+            ends_ = [l for l in an["locs"] if l["loc"] in sp["locations"] and l.get("spur_leg") == "end"]
+            for l in ends_:
+                if not _is_odf_loc(l):
+                    far.append({"loc": l["loc"], "pos": l["pos"], "spur": sp["name"], "spur_m": l.get("spur_m"),
+                                "n_fibres": len(l["fnos"]), "named": _is_named(l), "scheduled": l.get("scheduled")})
+        big = [l for l in an["locs"] if len(l["fnos"]) >= nmin or _is_named(l)]
+        snaps = {x["sig"]: x for x in self.snapshots(section)}
+        allds = sorted(self.datasets(section), key=lambda d: (d["t_to"] or "", d["id"]))
+        prev = [d for d in allds if d.get("content_sig") in snaps and d["id"] != ds and (d["t_to"] or "") <= (info["t_to"] or "")]
+        line = None
+        if prev:
+            line = self.lineup(section, prev[-1]["id"], ds, st)
+            line["base_label"] = prev[-1]["label"]
+        return {"dataset": {k: info.get(k) for k in ("id", "label", "t_from", "t_to", "n_fibres", "both_ends", "one_end",
+                                                     "schedule", "content_sig")},
+                "snapshot": snaps.get(info.get("content_sig")), "settings": st, "ends": ends,
+                "route_odfs": route, "spur_ends": far,
+                "spurs": [{k: sp.get(k) for k in ("name", "start", "length", "ribbons", "locations")} for sp in an["spurs"]],
+                "joints": {"all": len(big), "named": sum(1 for l in big if _is_named(l)),
+                           "unnamed": [{"loc": l["loc"], "pos": l["pos"], "n_fibres": len(l["fnos"])}
+                                       for l in big if not _is_named(l)][:40]},
+                "groups": [{k: g.get(k) for k in ("id", "label")} for g in an["groups"]],
+                "lineup": line}
+
+    def set_snapshot(self, section, ds, st, by="", note="", remove=False, checks=None):
+        """Save a checked test as a snapshot with the criteria it was checked with, or take it off."""
+        info = next((x for x in self.datasets(section) if x["id"] == ds), None)
+        if not info:
+            raise KeyError("dataset")
+        snaps = [x for x in self.snapshots(section) if x["sig"] != info.get("content_sig")]
+        entry = None
+        if not remove:
+            rv = self.review(section, ds, st)
+            entry = {"sig": info.get("content_sig"), "label": info["label"], "t_from": info["t_from"],
+                     "t_to": info["t_to"], "by": by, "at": time.strftime("%Y-%m-%d %H:%M"),
+                     "note": " ".join(str(note or "").split())[:300], "settings": dict(st),
+                     "checks": checks or {}, "ends": rv["ends"],
+                     "route_odfs": [r["loc"] for r in rv["route_odfs"]], "spurs": [sp["name"] for sp in rv["spurs"]],
+                     "joints": rv["joints"]["all"], "named": rv["joints"]["named"],
+                     "lineup": None if not rv["lineup"] else {
+                         "with": rv["lineup"]["base_label"], "matched": rv["lineup"]["matched"],
+                         "moved": len(rv["lineup"]["moved"]), "only_before": len(rv["lineup"]["only_before"]),
+                         "only_now": len(rv["lineup"]["only_now"])}}
+            snaps.append(entry)
+        snaps.sort(key=lambda x: (x.get("t_to") or "", x.get("at") or ""))
+        self.save_snapshots(section, snaps)
+        return {"snapshot": entry, "snapshots": snaps}
+
+    def trend(self, section, st, group=None, ids=None):
+        """Fails at every joint in every kept pull (or the chosen ones), oldest first."""
+        t = self.track(section, ids, st, group)
+        return {k: t[k] for k in ("pulls", "joints", "settings", "group")}
+
+    def track(self, section, ids, st, group=None, frozen=True):
+        """Brunel 1.1.3: follow every splice across as many pulls as wanted (all when ids is empty),
+        oldest first: its loss in each test and what happened to it (still failing, new, fixed, came
+        back, not in the latest). Joints are matched across pulls by name, or by place when unnamed;
+        a splice is one fibre at one joint (its worst splice there, as in compare)."""
+        allp = sorted(self.datasets(section), key=lambda d: (d["t_to"] or "", d["id"]))
+        want = {int(i) for i in (ids or [])}
+        pulls = [d for d in allp if not want or d["id"] in want]
+        joints, out_pulls, sp = [], [], {}
+        snaps = {x["sig"]: x for x in self.snapshots(section)} if frozen else {}
+        for d in pulls:
+            sn = snaps.get(d.get("content_sig"))
+            dst = dict(DEFAULT_SETTINGS) | sn["settings"] if sn and sn.get("settings") else st
+            rows, an = self.judged(section, d["id"], dst)
+            gsel = next((g for g in an["groups"] if g["id"] == group), None)
+            keep = gsel["fnos"] if gsel else None
+            fails, judged = {}, {}
+            for r in rows.values():
+                if keep is not None and r["fno"] not in keep:
+                    continue
+                judged[r["loc"]] = judged.get(r["loc"], 0) + 1
+                if r["fail"]:
+                    fails[r["loc"]] = fails.get(r["loc"], 0) + 1
+            out_pulls.append({"id": d["id"], "label": d["label"], "t_from": d["t_from"], "t_to": d["t_to"],
+                              "fails": sum(fails.values()), "judged": sum(judged.values()),
+                              "baseline": bool((d.get("notes") or {}).get("baseline")),
+                              "snapshot": bool(sn), "settings": dst if sn else None})
+            used, jof = set(), {}
+            for l in an["locs"]:
+                if l["loc"] not in judged:
+                    continue
+                j = _trend_joint(joints, l, used)
+                if j is None:
+                    j = {"key": len(joints), "loc": l["loc"], "pos": l["pos"], "spur_d": l.get("spur_d"),
+                         "spur_leg": l.get("spur_leg"), "spur_m": l.get("spur_m"), "spur": l.get("spur"),
+                         "sodf": l.get("sodf"), "kind": l.get("kind"), "named": _is_named(l), "fails": {}, "judged": {}}
+                    joints.append(j)
+                elif _is_named(l) and not j["named"]:
+                    j.update(loc=l["loc"], named=True, kind=l.get("kind"))
+                used.add(id(j))
+                jof[l["loc"]] = j
+                j["fails"][d["id"]] = j["fails"].get(d["id"], 0) + fails.get(l["loc"], 0)
+                j["judged"][d["id"]] = j["judged"].get(d["id"], 0) + judged[l["loc"]]
+                j["spur"] = l.get("spur") or j["spur"]
+            for r in rows.values():
+                if keep is not None and r["fno"] not in keep:
+                    continue
+                j = jof.get(r["loc"])
+                if j is None:
+                    continue
+                k = (r["fno"], j["key"])
+                e = sp.setdefault(k, {"fno": r["fno"], "ribbon": r["ribbon"], "joint": j, "values": {}, "fail": {},
+                                      "how": {}, "limit": {}})
+                old = e["values"].get(d["id"])
+                if old is None or r["value"] > old:
+                    e["values"][d["id"]], e["fail"][d["id"]] = r["value"], r["fail"]
+                    e["how"][d["id"]], e["limit"][d["id"]] = r["how"], r["limit"]
+        order = [p["id"] for p in out_pulls]
+        lab = {p["id"]: p["label"] for p in out_pulls}
+        rows, counts = [], {k: 0 for k in TRACK_STATUS}
+        for e in sp.values():
+            if not any(e["fail"].values()):
+                continue
+            status, since = _track_status([e["fail"].get(i) for i in order], order)
+            counts[status] += 1
+            j = e["joint"]
+            vals = [e["values"].get(i) for i in order]
+            seen = [v for v in vals if v is not None]
+            rows.append({"fno": e["fno"], "ribbon": e["ribbon"], "loc": j["loc"], "pos": j["pos"],
+                         "spur": j["spur"], "spur_leg": j["spur_leg"], "spur_m": j["spur_m"], "sodf": j["sodf"],
+                         "values": {str(i): e["values"].get(i) for i in order},
+                         "fail": {str(i): e["fail"].get(i) for i in order},
+                         "how": {str(i): e["how"].get(i) for i in order},
+                         "limit": next((e["limit"][i] for i in reversed(order) if i in e["limit"]), None),
+                         "status": status, "since": since, "since_label": lab.get(since),
+                         "change": round(seen[-1] - seen[0], 3) if len(seen) >= 2 else None,
+                         "fails_in": sum(1 for v in e["fail"].values() if v)})
+        rows.sort(key=lambda r: (TRACK_STATUS.index(r["status"]), r["pos"], r["fno"]))
+        joints.sort(key=lambda j: (j["pos"], -1 if j["spur_d"] is None else j["spur_d"]))
+        for j in joints:
+            j.pop("named", None); j.pop("key", None)
+        return {"pulls": out_pulls, "joints": joints, "rows": rows, "counts": counts, "settings": st,
+                "group": group, "all": [{"id": d["id"], "label": d["label"], "t_to": d["t_to"]} for d in allp]}
+
     @staticmethod
     def _crow(b, n, status, meta):
         r = n or b
@@ -1011,7 +1485,9 @@ def aligned_spurs(locs, loc_f, groups):
             if f in gid:
                 cnt[gid[f]] = cnt.get(gid[f], 0) + 1
         jpos = statistics.median(l["pos"] for l in run)
-        spurs.append({"name": re.sub(r"\s+(N|S)?ODF$", "", far["loc"]) + " spur",
+        nm = (f"Spur at {jpos / 1000:.2f} km" if "(unscheduled)" in far["loc"] or far["loc"].startswith("Unnamed ")
+              else re.sub(r"\s+(N|S)?ODF$", "", far["loc"]) + " spur")
+        spurs.append({"name": nm,
                       "group": max(cnt, key=cnt.get) if cnt else None,
                       "locations": [l["loc"] for l in run], "start": jpos, "end": jpos, "junction": jpos,
                       "length": round(max(l["spur_len"] or 0 for l in run)),

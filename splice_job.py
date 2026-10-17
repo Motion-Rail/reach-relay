@@ -5,7 +5,7 @@ numbers are the same as the PC tools. Never sees a password: it prints NEED_TOKE
 signed in user's FMS token from stdin, like report_job.py.
 
 SPLICE_JOB (JSON env): {"mode": "pull"|"rebuild", "section": "RGAC-SNBC-A-R432", "rtuA", "rtuB",
-  "ribbons": "" or "7" or "3-6", "testType": "iOLM", "data": "/tmp/rft-splice", "dist": "/path/Distances.xlsx" or "",
+  "ribbons": "" or "7" or "3-6", "testType": "iOLM", "data": "/tmp/rft-splice", "dist": "/path/Distances.xlsx" or "", "learned": [...] (no Distances: Brunel 1.0 learned locations),
   "user": "...", "fmsBase": "https://..."}
 Lines out: MARK|end|fibre|state|date, PHASE|text, SETEND|end|label|n, DONE|{json}, ERROR|text.
 """
@@ -95,6 +95,7 @@ def main():
     fms_pull.cache_load = lambda name, max_age_h=24: None
     fms_pull.cache_save = lambda name, data: None
     ci_store.DIST_OVERRIDE = CFG.get("dist") or None
+    ci_store.LEARNED_FOR = lambda cable: CFG.get("learned") or None
     store = ci_store.Store(CFG["data"])
     prog = LineProgress()
     log = lambda line: say("LOG|" + str(line))          # noqa: E731

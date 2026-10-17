@@ -38,7 +38,9 @@ import threading
 import time
 import uuid
 
-from fastapi import APIRouter, Header, HTTPException
+from urllib.parse import quote
+
+from fastapi import APIRouter, Header, HTTPException, Response
 from pydantic import BaseModel
 
 HERE = os.path.dirname(os.path.abspath(__file__))
@@ -47,6 +49,137 @@ import ci_store  # noqa: E402
 
 WORK = os.environ.get("SPLICE_WORK") or os.path.join(tempfile.gettempdir(), "rft-splice")
 FMS_BASE = os.environ.get("FMS_HOST") or os.environ.get("EXFO_AUTH_BASE") or "https://raman.ems.exfo-fms.com"
+_LEARNED = {}
+
+
+def learned_for(cable: str):
+    """Brunel 1.0's learned locations for a cable with no Distances schedule, so the Splice loss
+    view names its joints the same way (cached a few minutes; None when there are none)."""
+    try:
+        import learned_locations as ll
+        import relay_assets as ra
+        key = ra.key_of(cable)
+        hit = _LEARNED.get(key)
+        if hit and time.time() - hit[0] < 300:
+            return hit[1]
+        st, ok = ra.read(key)
+        out = None
+        if ok and st:
+            out = [{"name": ll.label(L), "distance_m": L["distance_m"], "tolerance_m": L.get("tolerance_m"),
+                    "type": L.get("type") or ""} for L in ll.active(st)
+                   if L.get("status") != "notjoint" and L.get("distance_m") is not None] or None
+        if ok:
+            _LEARNED[key] = (time.time(), out)
+        return out
+    except Exception:                       # noqa: BLE001
+        return None
+
+
+ci_store.LEARNED_FOR = learned_for
+
+
+def _names_to_repo(section: str, names: list):
+    """Brunel 1.1.3: joints named in the app are kept in the log repo, so a relay restart keeps them."""
+    fr = _repo()
+    if fr.repo_on():
+        fr.gh_put_bytes(f"splice/{section}/names.json", json.dumps({"names": names}, indent=1).encode(),
+                        f"Joint names for {section}")
+
+
+NAMES_READY: set = set()
+HIST_LOCK = threading.Lock()
+
+
+def _keep_pull(section: str, ds: int) -> bool:
+    """Brunel 1.1.3: every pull is kept in the log repo (splice/<section>/history/), so the Over time and
+    Compare views have every earlier test even after a relay restart, when only the latest results of each
+    fibre are rebuilt from raw.tgz."""
+    fr = _repo()
+    if not fr.repo_on():
+        return False
+    d = next((x for x in STORE.datasets(section) if x["id"] == ds), None)
+    if not d:
+        return False
+    fname = f"{(d.get('t_to') or 'unknown')[:10]}_{(d.get('content_sig') or str(ds))[:10]}.json.gz"
+    with HIST_LOCK:
+        idx = fr.gh_get_json(f"splice/{section}/history/index.json", None) or []
+        if any(x.get("file") == fname for x in idx):
+            return True
+        if not fr.gh_put_bytes(f"splice/{section}/history/{fname}", STORE.export_pull(section, ds),
+                               f"Splice loss pull {d.get('label')} for {section}"):
+            return False
+        idx.append({"file": fname, "label": d.get("label"), "t_from": d.get("t_from"), "t_to": d.get("t_to"),
+                    "sig": d.get("content_sig"), "kept": time.strftime("%Y-%m-%d %H:%M")})
+        idx.sort(key=lambda x: (x.get("t_to") or "", x.get("kept") or ""))
+        return fr.gh_put_bytes(f"splice/{section}/history/index.json", json.dumps(idx, indent=1).encode(),
+                               f"Splice loss history index for {section}")
+
+
+def _history_from_repo(section: str) -> int:
+    """After a restart: the kept pulls back into the store, oldest first, before the latest is rebuilt."""
+    fr = _repo()
+    if not fr.repo_on():
+        return 0
+    idx = fr.gh_get_json(f"splice/{section}/history/index.json", None) or []
+    n = 0
+    for x in sorted(idx, key=lambda x: (x.get("t_to") or "", x.get("kept") or "")):
+        f = str(x.get("file") or "")
+        if not re.fullmatch(r"[0-9A-Za-z_\-]+\.json\.gz", f):
+            continue
+        b = fr.gh_get_bytes(f"splice/{section}/history/{f}")
+        if not b:
+            continue
+        try:
+            if STORE.import_pull(section, b):
+                n += 1
+        except Exception:                   # noqa: BLE001
+            continue
+    return n
+
+
+def _names_from_repo(section: str):
+    """After a restart the work folder is empty: bring the cable's names back before any pull is built."""
+    if section in NAMES_READY:
+        return
+    path = os.path.join(STORE.folder(section), "names.json")
+    if not os.path.exists(path):
+        fr = _repo()
+        got = fr.gh_get_json(f"splice/{section}/names.json", None) if fr.repo_on() else None
+        if got and isinstance(got.get("names"), list):
+            os.makedirs(os.path.dirname(path), exist_ok=True)
+            with open(path, "w", encoding="utf-8") as fh:
+                json.dump({"names": got["names"]}, fh, indent=1)
+    NAMES_READY.add(section)
+
+
+ci_store.NAMES_SAVED = _names_to_repo
+
+
+def _snaps_to_repo(section: str, snaps: list):
+    fr = _repo()
+    if fr.repo_on():
+        fr.gh_put_bytes(f"splice/{section}/snapshots.json", json.dumps({"snapshots": snaps}, indent=1).encode(),
+                        f"Splice loss snapshots for {section}")
+
+
+SNAPS_READY: set = set()
+
+
+def _snaps_from_repo(section: str):
+    if section in SNAPS_READY:
+        return
+    path = os.path.join(STORE.folder(section), "snapshots.json")
+    if not os.path.exists(path):
+        fr = _repo()
+        got = fr.gh_get_json(f"splice/{section}/snapshots.json", None) if fr.repo_on() else None
+        if got and isinstance(got.get("snapshots"), list):
+            os.makedirs(os.path.dirname(path), exist_ok=True)
+            with open(path, "w", encoding="utf-8") as fh:
+                json.dump({"snapshots": got["snapshots"]}, fh, indent=1)
+    SNAPS_READY.add(section)
+
+
+ci_store.SNAPS_SAVED = _snaps_to_repo
 STORE = ci_store.Store(WORK)
 JOBS: dict[str, dict] = {}
 LOCK = threading.Lock()
@@ -97,6 +230,25 @@ class CompareIn(ViewIn):
 class SettingsIn(BaseModel):
     stem: str
     settings: dict
+
+
+class TrackIn(ViewIn):
+    ids: list[int] = []
+    frozen: bool = True
+
+
+class SnapIn(ViewIn):
+    remove: bool = False
+    note: str = ""
+    checks: dict = {}
+
+
+class NameIn(BaseModel):
+    stem: str
+    loc: str
+    name: str = ""
+    type: str = ""
+    ds: int = 0
 
 
 def section_of(stem: str) -> str:
@@ -232,10 +384,19 @@ def latest_ds(section: str) -> dict | None:
 
 # ── jobs ──────────────────────────────────────────────────────────────────────────────────
 def public(j: dict) -> dict:
+    """A copy of the job for the page. The job thread keeps adding fibres while this is read, so the
+    dicts are copied (and the copy retried if one changed under it) rather than handed out live."""
+    for _ in range(5):
+        try:
+            ends = {e: {"label": v["label"], "n": v["n"], "fibres": dict(v["fibres"]), "dates": dict(v["dates"])}
+                    for e, v in list(j["ends"].items())}
+            break
+        except RuntimeError:
+            time.sleep(0.01)
+    else:
+        ends = {}
     return {k: j.get(k) for k in ("id", "kind", "state", "stem", "section", "ribbons", "user", "started", "ended",
-                                  "phase", "error", "result", "saved")} | {
-        "ends": {e: {"label": v["label"], "n": v["n"], "fibres": v["fibres"], "dates": v["dates"]}
-                 for e, v in j["ends"].items()}, "log": j["log"][-12:]}
+                                  "phase", "error", "result", "saved")} | {"ends": ends, "log": list(j["log"])[-12:]}
 
 
 def _dist_for(stem: str, folder: str) -> str:
@@ -253,6 +414,8 @@ def _run(j: dict, token_fn):
         cfg = {"mode": j["kind"], "section": j["section"], "rtuA": j.get("rtuA", ""), "rtuB": j.get("rtuB", ""),
                "ribbons": j.get("ribbons", ""), "testType": j.get("testType", "iOLM"), "data": WORK,
                "dist": _dist_for(j["stem"], folder), "user": j.get("user", ""), "fmsBase": FMS_BASE}
+        if not cfg["dist"]:
+            cfg["learned"] = learned_for(j["stem"])
         env = {**os.environ, "SPLICE_JOB": json.dumps(cfg), "PYTHONUNBUFFERED": "1", "MALLOC_ARENA_MAX": "2"}
         p = subprocess.Popen([sys.executable, JOB_SCRIPT], cwd=HERE, env=env, text=True,
                              stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, bufsize=1)
@@ -296,6 +459,12 @@ def _run(j: dict, token_fn):
         j["result"], j["state"], j["phase"] = res, "done", "Done"
         if j["kind"] == "pull":
             j["saved"] = _save_raw(j["section"])
+        try:                                # Brunel 1.1.3: keep every pull, so results can be compared over time
+            d = latest_ds(j["section"])
+            if d:
+                _keep_pull(j["section"], d["id"])
+        except Exception:                   # noqa: BLE001
+            pass
     except Exception as e:                  # noqa: BLE001
         j["state"], j["error"] = "error", str(e)[:300]
     finally:
@@ -327,16 +496,26 @@ def start_job(kind: str, stem: str, section: str, user: str = "", token_fn=None,
 
 def ensure_ready(stem: str, section: str) -> dict:
     """The store has this cable, or a rebuild from the saved raw store is on its way."""
-    if latest_ds(section):
-        return {"state": "ready"}
+    for fn in (_names_from_repo, _snaps_from_repo):
+        try:
+            fn(section)
+        except Exception:                   # noqa: BLE001
+            pass
     p = PREP.get(section)
     if p and p["state"] == "running":
-        return {"state": "preparing"}
+        return {"state": "preparing"}       # kept pulls may be back already; the latest is still being rebuilt
+    if latest_ds(section):
+        return {"state": "ready"}
     if p and p["state"] in ("none", "error") and time.time() - p.get("t", 0) < 120:
         return {"state": p["state"], "note": p.get("note", "")}
-    if not os.path.isdir(os.path.join(STORE.folder(section), "raw")) and not _restore_raw(section):
+    has_raw = os.path.isdir(os.path.join(STORE.folder(section), "raw")) or _restore_raw(section)
+    try:
+        kept = _history_from_repo(section)   # earlier pulls first, so the rebuilt latest lands on top
+    except Exception:                       # noqa: BLE001
+        kept = 0
+    if not has_raw:
         PREP[section] = {"state": "none", "t": time.time()}
-        return {"state": "none"}
+        return {"state": "ready"} if kept else {"state": "none"}
     PREP[section] = {"state": "running", "t": time.time()}
     try:
         start_job("rebuild", stem, section)
@@ -364,9 +543,12 @@ def make_router(valid_token, check_key, sessions: dict) -> APIRouter:
         job = next((public(j) for j in sorted(JOBS.values(), key=lambda x: -x["started"])
                     if j["section"] == section and j["kind"] == "pull"), None)
         ds = STORE.datasets(section) if latest_ds(section) else []
+        snaps = {x["sig"]: x for x in STORE.snapshots(section)}
         return {"ok": True, "section": section, "ready": ready, "raw": raw, "job": job,
                 "datasets": [{k: d.get(k) for k in ("id", "label", "t_from", "t_to", "n_fibres", "both_ends", "imported_at",
-                                                    "schedule")} for d in ds],
+                                                    "schedule")} | {"baseline": bool((d.get("notes") or {}).get("baseline")),
+                                                                    "snapshot": snaps.get(d.get("content_sig"))}
+                             for d in ds],
                 "settings": await asyncio.to_thread(saved_settings, section)}
 
     @router.post("/api/splice/update")
@@ -449,6 +631,106 @@ def make_router(valid_token, check_key, sessions: dict) -> APIRouter:
         section = section_of(body.stem)
         st = await asyncio.to_thread(settings_for, section, body.view)
         return await asyncio.to_thread(STORE.odf, section, _ds(section, body.ds), st)
+
+    @router.post("/api/splice/trend")
+    async def trend(body: ViewIn, x_app_key: str | None = Header(default=None), x_session: str | None = Header(default=None)):
+        """Brunel 1.1.3: fails at every joint in every kept pull, oldest first."""
+        await guard(x_app_key, x_session)
+        section = section_of(body.stem)
+        _ds(section, 0)
+        st = await asyncio.to_thread(settings_for, section, body.view)
+        return await asyncio.to_thread(STORE.trend, section, st, body.group or None)
+
+    @router.post("/api/splice/track")
+    async def track(body: TrackIn, x_app_key: str | None = Header(default=None), x_session: str | None = Header(default=None)):
+        """Brunel 1.1.3: as many kept tests as wanted, every splice followed across them."""
+        await guard(x_app_key, x_session)
+        section = section_of(body.stem)
+        _ds(section, 0)
+        st = await asyncio.to_thread(settings_for, section, body.view)
+        return await asyncio.to_thread(STORE.track, section, body.ids[:200], st, body.group or None, body.frozen)
+
+    @router.post("/api/splice/track.xlsx")
+    async def track_xlsx(body: TrackIn, x_app_key: str | None = Header(default=None), x_session: str | None = Header(default=None)):
+        await guard(x_app_key, x_session)
+        section = section_of(body.stem)
+        _ds(section, 0)
+        st = await asyncio.to_thread(settings_for, section, body.view)
+        t = await asyncio.to_thread(STORE.track, section, body.ids[:200], st, body.group or None, body.frozen)
+        import ci_export
+        data = await asyncio.to_thread(ci_export.track_book, t, body.stem.upper())
+        fn = f"{body.stem.upper()} over time, {len(t['pulls'])} tests.xlsx"
+        return Response(data, media_type="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+                        headers={"Content-Disposition": f"attachment; filename*=UTF-8''{quote(fn)}"})
+
+    @router.post("/api/splice/review")
+    async def review(body: ViewIn, x_app_key: str | None = Header(default=None), x_session: str | None = Header(default=None)):
+        """Brunel 1.1.3: what to check before a test becomes a snapshot (end ODFs, ODFs along the route,
+        joints and spurs, criteria, line-up with the snapshot before)."""
+        await guard(x_app_key, x_session)
+        section = section_of(body.stem)
+        await asyncio.to_thread(_snaps_from_repo, section)
+        st = await asyncio.to_thread(settings_for, section, body.view)
+        try:
+            return await asyncio.to_thread(STORE.review, section, _ds(section, body.ds), st)
+        except KeyError:
+            raise HTTPException(404, "That test is not on the relay any more")
+
+    @router.post("/api/splice/snapshot")
+    async def snapshot(body: SnapIn, x_app_key: str | None = Header(default=None), x_session: str | None = Header(default=None)):
+        """Save a checked test as a snapshot with the criteria in force now (or take it off)."""
+        await guard(x_app_key, x_session)
+        section = section_of(body.stem)
+        user = str((sessions.get(x_session or "") or {}).get("user", "")).strip().lower()
+        await asyncio.to_thread(_snaps_from_repo, section)
+        st = await asyncio.to_thread(settings_for, section, body.view)
+        try:
+            return await asyncio.to_thread(STORE.set_snapshot, section, _ds(section, body.ds), st, user, body.note,
+                                           body.remove, {k: bool(v) for k, v in (body.checks or {}).items()})
+        except KeyError:
+            raise HTTPException(404, "That test is not on the relay any more")
+
+    @router.post("/api/splice/lineup")
+    async def lineup(body: CompareIn, x_app_key: str | None = Header(default=None), x_session: str | None = Header(default=None)):
+        await guard(x_app_key, x_session)
+        section = section_of(body.stem)
+        st = await asyncio.to_thread(settings_for, section, body.view)
+        try:
+            return await asyncio.to_thread(STORE.lineup, section, body.base, body.new, st)
+        except KeyError:
+            raise HTTPException(404, "One of those tests is not on the relay any more")
+
+    @router.post("/api/splice/compare.xlsx")
+    async def compare_xlsx(body: CompareIn, x_app_key: str | None = Header(default=None), x_session: str | None = Header(default=None)):
+        await guard(x_app_key, x_session)
+        section = section_of(body.stem)
+        st = await asyncio.to_thread(settings_for, section, body.view)
+        try:
+            c = await asyncio.to_thread(STORE.compare, section, body.base, body.new, st, body.group or None)
+        except KeyError:
+            raise HTTPException(404, "One of those pulls is not on the relay any more")
+        import ci_export
+        data = await asyncio.to_thread(ci_export.compare_book, c, body.stem.upper())
+        fn = f"{body.stem.upper()} compare {c['base']['label']} to {c['new']['label']}.xlsx".replace("/", "-")
+        return Response(data, media_type="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+                        headers={"Content-Disposition": f"attachment; filename*=UTF-8''{quote(fn)}"})
+
+    @router.post("/api/splice/name")
+    async def name(body: NameIn, x_app_key: str | None = Header(default=None), x_session: str | None = Header(default=None)):
+        """Name a joint found from the results (or one the schedule does not list). Saved for the cable and
+        matched by place, so every later test, and the pulls already stored, take the name."""
+        await guard(x_app_key, x_session)
+        section = section_of(body.stem)
+        user = str((sessions.get(x_session or "") or {}).get("user", "")).strip().lower()
+        await asyncio.to_thread(_names_from_repo, section)
+        try:
+            res = await asyncio.to_thread(STORE.set_name, section, _ds(section, body.ds), body.loc[:120],
+                                          body.name, body.type, user)
+        except KeyError as e:
+            raise HTTPException(404, str(e).strip("'"))
+        except ValueError as e:
+            raise HTTPException(400, str(e))
+        return {"ok": True, **res, "types": ci_store.JOINT_TYPES}
 
     @router.post("/api/splice/settings")
     async def settings(body: SettingsIn, x_app_key: str | None = Header(default=None), x_session: str | None = Header(default=None)):
