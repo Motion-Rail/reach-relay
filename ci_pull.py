@@ -284,6 +284,24 @@ def rebuild_from_raw(store, fms_dir, section, log=print, progress=None):
     return build_dataset(store, fp, fms_dir, rows, tally, {"label": ""}, "", None, None, "iOLM", progress, log)
 
 
+def odf_rows(rows, end):
+    """The ODF connector at this end: the first real event after the launch (position over 0) on
+    this end's own trace, the same rule as fms_pull.build_odf."""
+    out = []
+    for r in rows:
+        fno = ci_store.fibre_no(r.get("fid"))
+        if fno is None or not r.get("date"):
+            continue
+        evs = [e for e in (r.get("events") or []) if e.get("position") is not None and e["position"] > 0]
+        e = min(evs, key=lambda x: x["position"]) if evs else None
+        if e is None:
+            continue
+        out.append({"fno": fno, "end": end, "pos": e.get("position"), "type": e.get("type"),
+                    "refl": e.get("r1550"), "w1310": e.get("w1310"), "w1550": e.get("w1550"),
+                    "w1625": e.get("w1625"), "sw": r.get("sw_loss")})
+    return out
+
+
 def build_dataset(store, fp, fms_dir, rows, tally, form, ribbons, dfrom, dto, test_type, progress, log):
     progress.phase = "Pairing both ends"
     rowsA, labelA = rows["A"]
@@ -310,6 +328,7 @@ def build_dataset(store, fp, fms_dir, rows, tally, form, ribbons, dfrom, dto, te
            "type": e.get("type"), "ab": e.get("a1550"), "ba": e.get("b1550"), "dirs": e.get("dirs")}
           for e in events if ci_store.fibre_no(e.get("fid"))]
     data = ci_store.finish_data(rawA, rawB, ev, labelA, labelB)
+    data["odf"] = odf_rows(rowsA, "A") + odf_rows(rowsB, "B")
     sig = ci_store.content_sig(rawA, rawB)
     newer = sum(1 for r in rowsA + rowsB if r.get("newer_no_events"))
     both = len(set(rawA) & set(rawB))
@@ -318,6 +337,7 @@ def build_dataset(store, fp, fms_dir, rows, tally, form, ribbons, dfrom, dto, te
                "fibres": len(set(rawA) | set(rawB))}
     same = store.find_same(data["section"], sig)
     if same:
+        store.backfill_odf(data["section"], same["id"], data["odf"])
         summary["same_as"] = same["label"]
         progress.summary = summary
         progress.phase = "Done"

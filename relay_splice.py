@@ -12,6 +12,7 @@ POST /api/splice/cable    {stem, view?, group?}                ribbon by locatio
 POST /api/splice/location {stem, loc, ribbon?, view?}          every fibre at one location
 POST /api/splice/ribbon   {stem, ribbon, view?}                one ribbon across the cable
 POST /api/splice/compare  {stem, base, new, group?, view?}     solved, remaining, new between two pulls
+POST /api/splice/odf      {stem, view?}                        ODF connector at each end (Brunel 1.1.1)
 POST /api/splice/settings {stem, settings}                     save the cable's rules for everyone
 
 `view` is this viewer's filters (pass limit, split at 0.10, one end rule, S-ODF limit, NR ribbons); they
@@ -24,6 +25,7 @@ no FMS calls. Working files are in the temp folder (SPLICE_WORK).
 from __future__ import annotations
 
 import asyncio
+import calendar
 import io
 import json
 import os
@@ -50,7 +52,7 @@ JOBS: dict[str, dict] = {}
 LOCK = threading.Lock()
 PREP: dict[str, dict] = {}            # section -> {"state": "running"|"done"|"error"|"none", "note"}
 SETTINGS: dict[str, dict] = {}        # section -> saved settings (cache of LOG_REPO)
-RULE_KEYS = ("one_end", "nominal", "threshold", "split", "sodf_limit", "nr_ribbons", "spur_gap", "group_tol")
+RULE_KEYS = ("one_end", "nominal", "threshold", "split", "sodf_limit", "nr_ribbons", "spur_gap", "group_tol", "odf_limit")
 JOB_SCRIPT = os.path.join(HERE, "splice_job.py")
 STEM_RE = r"^F-[A-Z0-9]+-[A-Z0-9]+-[A-Z](-R\d+)?$"
 
@@ -109,7 +111,7 @@ def clean(new: dict, base: dict) -> dict:
     if new.get("one_end") in ("nominal", "auto", "exclude"):
         st["one_end"] = new["one_end"]
     for k, lo, hi in (("nominal", 0.0, 1.0), ("threshold", 0.01, 2.0), ("sodf_limit", 0.01, 3.0),
-                      ("spur_gap", 50, 20000), ("group_tol", 5, 5000)):
+                      ("spur_gap", 50, 20000), ("group_tol", 5, 5000), ("odf_limit", 0.05, 5.0)):
         if k in new:
             try:
                 v = float(new[k])
@@ -181,6 +183,44 @@ def _restore_raw(section: str) -> bool:
             with open(dest, "wb") as fh:
                 fh.write(tf.extractfile(m).read())
     return True
+
+
+LOSS_CACHE: dict[str, dict] = {}
+
+
+def latest_loss(stem: str) -> dict:
+    """Brunel 1.1.1: the latest stored iOLM of every fibre at each end (any age), for Cable View's loss and
+    length when no recent FMS Task tested the cable. {fibre: {"a": {t, loss, len, verdict, src}, "b": ...}}.
+    End A is the raw store's A (the cable's first RTU, as Cable View's end a)."""
+    section = stem.strip().upper()[2:]
+    folder = STORE.folder(section)
+    stamp = 0.0
+    for end in ("A", "B"):
+        d = os.path.join(folder, "raw", end)
+        if os.path.isdir(d):
+            stamp = max(stamp, os.path.getmtime(d))
+    if not stamp:
+        return {}
+    c = LOSS_CACHE.get(section)
+    if c and c["stamp"] == stamp:
+        return c["data"]
+    out: dict[int, dict] = {}
+    for end, k in (("A", "a"), ("B", "b")):
+        for fno, rec in ci_pull.RawStore(folder, end).all().items():
+            det = rec.get("det") or {}
+            t = det.get("testtime")
+            if not t:
+                continue
+            try:
+                ts = calendar.timegm(time.strptime(t[:19], "%Y-%m-%dT%H:%M:%S"))     # FMS times are UTC
+            except ValueError:
+                continue
+            loss = {str(w): det.get(f"w{w}") for w in (1310, 1550, 1625) if det.get(f"w{w}") is not None}
+            out.setdefault(fno, {})[k] = {"t": ts, "loss": loss, "len": det.get("length"),
+                                          "verdict": det.get("verdict") if det.get("verdict") in ("Pass", "Fail") else "",
+                                          "src": "FMS result"}
+    LOSS_CACHE[section] = {"stamp": stamp, "data": out}
+    return out
 
 
 def latest_ds(section: str) -> dict | None:
@@ -402,6 +442,13 @@ def make_router(valid_token, check_key, sessions: dict) -> APIRouter:
             return await asyncio.to_thread(STORE.compare, section, body.base, body.new, st, body.group or None)
         except KeyError:
             raise HTTPException(404, "One of those pulls is not on the relay any more")
+
+    @router.post("/api/splice/odf")
+    async def odf(body: ViewIn, x_app_key: str | None = Header(default=None), x_session: str | None = Header(default=None)):
+        await guard(x_app_key, x_session)
+        section = section_of(body.stem)
+        st = await asyncio.to_thread(settings_for, section, body.view)
+        return await asyncio.to_thread(STORE.odf, section, _ds(section, body.ds), st)
 
     @router.post("/api/splice/settings")
     async def settings(body: SettingsIn, x_app_key: str | None = Header(default=None), x_session: str | None = Header(default=None)):

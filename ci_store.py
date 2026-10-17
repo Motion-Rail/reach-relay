@@ -34,7 +34,8 @@ MATCH_TOL_M = 30.0
 DIST_OVERRIDE = None        # a Distances workbook to use instead of the one next to fms_pull (the relay)
 FIBRES_PER_RIBBON = 12
 DEFAULT_SETTINGS = {"one_end": "nominal", "nominal": 0.02, "threshold": 0.15, "split": False,
-                    "sodf_limit": 0.30, "nr_ribbons": "1-18", "spur_gap": 1500, "group_tol": 100}
+                    "sodf_limit": 0.30, "nr_ribbons": "1-18", "spur_gap": 1500, "group_tol": 100,
+                    "odf_limit": 0.50}
 
 SCHEMA = """
 CREATE TABLE IF NOT EXISTS datasets(
@@ -51,6 +52,9 @@ CREATE TABLE IF NOT EXISTS events(
 CREATE TABLE IF NOT EXISTS locations(
   ds INTEGER, loc TEXT, ord INTEGER, pos REAL, kind TEXT, n_fibres INTEGER,
   scheduled INTEGER);
+CREATE TABLE IF NOT EXISTS odf(
+  ds INTEGER, fno INTEGER, ribbon INTEGER, end_ TEXT, pos REAL, type TEXT,
+  refl REAL, w1310 REAL, w1550 REAL, w1625 REAL, sw REAL);
 CREATE INDEX IF NOT EXISTS ev_ds ON events(ds, loc);
 CREATE INDEX IF NOT EXISTS fi_ds ON fibres(ds);
 """
@@ -380,6 +384,9 @@ class Store:
                          a.get("l1550"), a.get("l1625"), b.get("l1310"), b.get("l1550"),
                          b.get("l1625")))
         con.executemany("INSERT INTO fibres VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?)", rows)
+        con.executemany("INSERT INTO odf VALUES(?,?,?,?,?,?,?,?,?,?,?)", [
+            (ds, o["fno"], ribbon_of(o["fno"]), o["end"], o.get("pos"), o.get("type"), o.get("refl"),
+             o.get("w1310"), o.get("w1550"), o.get("w1625"), o.get("sw")) for o in data.get("odf") or []])
         con.executemany("INSERT INTO events VALUES(?,?,?,?,?,?,?,?,?)", [
             (ds, e["fno"], ribbon_of(e["fno"]), e["position"], e["type"], e["ab"], e["ba"],
              e["dirs"], e.get("location")) for e in data["events"]])
@@ -577,6 +584,53 @@ class Store:
             c.pop("_rank", None)
         return {"ribbon": ribbon, "fibres": fibres, "locations": locs, "cells": cells, "settings": st}
 
+
+    # ---------------------------------------------------------------- ODF connectors
+    def backfill_odf(self, section, ds, odf):
+        """Pulls stored before the ODF view have no ODF rows: add them when the same results come round."""
+        con = self.db(section)
+        if con.execute("SELECT COUNT(*) FROM odf WHERE ds=?", (ds,)).fetchone()[0] or not odf:
+            return False
+        con.executemany("INSERT INTO odf VALUES(?,?,?,?,?,?,?,?,?,?,?)", [
+            (ds, o["fno"], ribbon_of(o["fno"]), o["end"], o.get("pos"), o.get("type"), o.get("refl"),
+             o.get("w1310"), o.get("w1550"), o.get("w1625"), o.get("sw")) for o in odf])
+        con.commit()
+        return True
+
+    def odf(self, section, ds, st):
+        """The ODF connector next to each RTU: the first event after the launch on that end's own
+        trace (the same rule as fms_pull.build_odf and the report's ODF Connection sheet).
+        Pass at or under the ODF limit (default 0.5 dB at 1550), fail above it."""
+        con = self.db(section)
+        info = dict(con.execute("SELECT * FROM datasets WHERE id=?", (ds,)).fetchone())
+        lim = float(st.get("odf_limit", 0.5))
+        fib = {r["fno"]: dict(r) for r in con.execute("SELECT fno, ribbon, date_a, date_b FROM fibres WHERE ds=?", (ds,))}
+        rows = {}
+        for r in con.execute("SELECT * FROM odf WHERE ds=?", (ds,)):
+            d = dict(r)
+            v = d["w1550"]
+            d["fail"] = v is not None and v > lim
+            rows.setdefault(d["fno"], {})[d["end_"]] = d
+        out, counts = [], {"A": {"tested": 0, "fail": 0, "none": 0}, "B": {"tested": 0, "fail": 0, "none": 0}}
+        for fno in sorted(set(fib) | set(rows)):
+            rec = {"fno": fno, "ribbon": ribbon_of(fno)}
+            for end in ("A", "B"):
+                e = (rows.get(fno) or {}).get(end)
+                tested = bool((fib.get(fno) or {}).get("date_a" if end == "A" else "date_b"))
+                if e and e["w1550"] is not None:
+                    counts[end]["tested"] += 1
+                    counts[end]["fail"] += e["fail"]
+                elif tested:
+                    counts[end]["none"] += 1
+                rec[end] = {k: e[k] for k in ("pos", "type", "refl", "w1310", "w1550", "w1625", "sw", "fail")} if e else None
+            out.append(rec)
+        vals = {end: [r[end]["w1550"] for r in out if r[end] and r[end]["w1550"] is not None] for end in ("A", "B")}
+        for end in ("A", "B"):
+            xs = sorted(vals[end])
+            counts[end]["median"] = round(xs[len(xs) // 2], 3) if xs else None
+            counts[end]["worst"] = round(xs[-1], 3) if xs else None
+        return {"dataset": info, "limit": lim, "site_a": info.get("site_a"), "site_b": info.get("site_b"),
+                "counts": counts, "fibres": out, "settings": st}
 
     # ---------------------------------------------------------------- snapshots and compare
     def set_dataset(self, section, ds, label=None, baseline=None):

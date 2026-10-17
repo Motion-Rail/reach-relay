@@ -32,6 +32,7 @@ import os
 import fms_continuity as fc
 
 DAYS = max(1, int(os.getenv("FIBRES_DAYS", "90")))
+LONG_DAYS = max(DAYS, int(os.getenv("FIBRES_LONG_DAYS", "365")))   # Brunel 1.1.1: a cable with nothing recent looks this far back
 MAX_TASKS = max(20, int(os.getenv("FIBRES_MAX_TASKS", "300")))
 BASE_TTL = 60            # seconds the grid is kept before the logs and Tasks are read again
 LIVE_TTL = 4             # running Tasks are read at most this often
@@ -234,7 +235,7 @@ def _list(path: str, ttl: float) -> list[dict]:
         return c["items"]
     items = _gh_list_sync(path)
     DIRS[path] = {"t": time.time(), "items": items}
-    _cap(DIRS, 300)
+    _cap(DIRS, 900)
     return items
 
 
@@ -251,26 +252,34 @@ def _read(item: dict) -> dict | None:
 
 
 def log_reports(stem: str) -> list[dict]:
-    """E2E and Uni-dir reports for this cable, from the file names, so other cables are never opened."""
+    """E2E and Uni-dir reports for this cable, from the file names, so other cables are never opened.
+    Brunel 1.1.1: a cable with no runs in the last FIBRES_DAYS (a section whose testers are now offline)
+    looks back up to FIBRES_LONG_DAYS, so its latest results still show."""
     if not _log_on():
         return []
     key = re.sub(r"[^A-Za-z0-9-]", "", stem.upper())
     today = time.strftime("%Y-%m-%d", time.gmtime())
     days = {i.get("name") for i in _list("runs", 60)}
     out = []
-    for d in range(DAYS):
-        day = time.strftime("%Y-%m-%d", time.gmtime(time.time() - d * 86400))
-        if day not in days:
-            continue
-        for item in _list(f"runs/{day}", 60 if day == today else 3600):
-            nm = str(item.get("name", ""))
-            if nm.endswith(".json") and key in nm.upper():
-                try:
-                    rep = _read(item)
-                except Exception:                       # noqa: BLE001
-                    rep = None
-                if rep:
-                    out.append(rep)
+
+    def scan(d0, d1):
+        for d in range(d0, d1):
+            day = time.strftime("%Y-%m-%d", time.gmtime(time.time() - d * 86400))
+            if day not in days:
+                continue
+            ttl = 60 if day == today else 3600 if d < 3 else 30 * 86400      # old days never change
+            for item in _list(f"runs/{day}", ttl):
+                nm = str(item.get("name", ""))
+                if nm.endswith(".json") and key in nm.upper():
+                    try:
+                        rep = _read(item)
+                    except Exception:                       # noqa: BLE001
+                        rep = None
+                    if rep:
+                        out.append(rep)
+    scan(0, DAYS)
+    if not out and LONG_DAYS > DAYS:
+        scan(DAYS, LONG_DAYS)
     return out
 
 
@@ -491,8 +500,28 @@ def make_router(valid_token, check_key, sessions: dict) -> APIRouter:
             notes.append(SCAN["note"])
         if len(ends) < 2:
             notes.append("Only one end of this cable was found in FMS.")
+        rows = b["data"]["rows"]
+        try:                                            # Brunel 1.1.1: the latest stored FMS results, any age
+            import relay_splice
+            extra = await asyncio.to_thread(relay_splice.latest_loss, stem)
+        except Exception:                               # noqa: BLE001
+            extra = {}
+        if extra:
+            rows = [dict(r) for r in rows]
+            for r in rows:
+                got = extra.get(r["f"])
+                if not got:
+                    continue
+                for k in ("a", "b"):
+                    x = got.get(k)
+                    cur = (r.get("iolm") or {}).get(k)
+                    if x and (not cur or (cur.get("t") or 0) < x["t"] - 60):
+                        r["iolm"] = {**(r.get("iolm") or {}), k: x}
+            if not any(r.get("iolm") for r in b["data"]["rows"]):
+                notes.append("Loss and length are the latest stored FMS results (Splice loss Update), "
+                             "as no FMS Task in the last %d days tested this cable." % DAYS)
         return {"ok": True, "stem": stem, "ends": [{k: e[k] for k in ("rtu", "rtuId", "site")} for e in ends[:2]],
-                "fibres": b["data"]["rows"], "updated": b["t"], "notes": notes, "live": live,
+                "fibres": rows, "updated": b["t"], "notes": notes, "live": live,
                 "scan": {"busy": SCAN["busy"], "tasks": SCAN["seen"], "days": DAYS}}
 
     @router.post("/api/fibre")
