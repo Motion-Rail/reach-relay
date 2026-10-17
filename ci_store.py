@@ -28,6 +28,8 @@ import time
 
 import openpyxl
 
+import ci_align
+
 SPLICE_TYPES = ("Splice", "Group")
 END_MARGIN_M = 100.0
 MATCH_TOL_M = 30.0
@@ -41,17 +43,17 @@ SCHEMA = """
 CREATE TABLE IF NOT EXISTS datasets(
   id INTEGER PRIMARY KEY, label TEXT, source TEXT, sha1 TEXT, imported_at TEXT,
   section TEXT, cable TEXT, site_a TEXT, site_b TEXT, t_from TEXT, t_to TEXT,
-  n_fibres INTEGER, n_events INTEGER, schedule TEXT, content_sig TEXT, notes TEXT);
+  n_fibres INTEGER, n_events INTEGER, schedule TEXT, content_sig TEXT, notes TEXT, align INTEGER);
 CREATE TABLE IF NOT EXISTS fibres(
   ds INTEGER, fno INTEGER, fid TEXT, ribbon INTEGER,
   date_a TEXT, date_b TEXT, len_a REAL, len_b REAL,
   a1310 REAL, a1550 REAL, a1625 REAL, b1310 REAL, b1550 REAL, b1625 REAL);
 CREATE TABLE IF NOT EXISTS events(
   ds INTEGER, fno INTEGER, ribbon INTEGER, pos REAL, type TEXT,
-  ab REAL, ba REAL, dirs INTEGER, loc TEXT);
+  ab REAL, ba REAL, dirs INTEGER, loc TEXT, bpos REAL, spur_d REAL, spur_len REAL);
 CREATE TABLE IF NOT EXISTS locations(
   ds INTEGER, loc TEXT, ord INTEGER, pos REAL, kind TEXT, n_fibres INTEGER,
-  scheduled INTEGER);
+  scheduled INTEGER, spur_d REAL, spur_len REAL);
 CREATE TABLE IF NOT EXISTS odf(
   ds INTEGER, fno INTEGER, ribbon INTEGER, end_ TEXT, pos REAL, type TEXT,
   refl REAL, w1310 REAL, w1550 REAL, w1625 REAL, sw REAL);
@@ -292,6 +294,46 @@ def _cluster_only(events):
     return "distance only"
 
 
+# --------------------------------------------------------------------------- backbone
+def _is_mid(e, cable_len):
+    p = e.get("position")
+    return (p is not None and p > END_MARGIN_M and (cable_len is None or p < cable_len - END_MARGIN_M)
+            and e.get("type") in ("Splice", "Group", "Connector", "Macrobend"))
+
+
+def _align_mid(mid, scheduled):
+    """Backbone distance for every mid route event, then the unscheduled joints clustered on it."""
+    res = ci_align.align(mid, scheduled)
+    ci_align.label_loose(mid, scheduled)
+    return res
+
+
+def _insert_locations(con, ds, mid, kinds):
+    """One row per location at its backbone distance. A location most of whose readings sit
+    inside a spur loop is a spur location: the junction's distance plus its place on the spur."""
+    groups = {}
+    for e in mid:
+        if e.get("location"):
+            groups.setdefault(e["location"], []).append(e)
+    rows = []
+    for k, xs in groups.items():
+        sp = [x for x in xs if x.get("spur_d") is not None]
+        if len(sp) * 2 >= len(xs):
+            pos = statistics.median(x["bpos"] for x in sp)
+            sd, sl = statistics.median(x["spur_d"] for x in sp), statistics.median(x["spur_len"] for x in sp)
+        else:
+            on = [x for x in xs if x.get("spur_d") is None] or xs
+            pos, sd, sl = statistics.median(x.get("bpos", x["position"]) for x in on), None, None
+        rows.append([k, pos, sd, sl, xs])
+    rows.sort(key=lambda r: (round(r[1]), -1 if r[2] is None else r[2]))
+    con.executemany("INSERT INTO locations(ds,loc,ord,pos,kind,n_fibres,scheduled,spur_d,spur_len) "
+                    "VALUES(?,?,?,?,?,?,?,?,?)", [
+        (ds, k, i, pos, kinds.get(k, ""), len({x["fno"] for x in xs}),
+         0 if any(x.get("unscheduled") for x in xs) else 1, sd, sl)
+        for i, (k, pos, sd, sl, xs) in enumerate(rows)])
+    return len(rows)
+
+
 # --------------------------------------------------------------------------- store
 class Store:
     def __init__(self, data_dir):
@@ -308,13 +350,32 @@ class Store:
     def db(self, section):
         folder = self.folder(section)
         os.makedirs(os.path.join(folder, "pulls"), exist_ok=True)
-        con = sqlite3.connect(os.path.join(folder, "store.sqlite"))
+        path = os.path.join(folder, "store.sqlite")
+        keep = os.path.join(folder, f"store.before-align-v{ci_align.ALIGN_V}.sqlite")
+        if os.path.exists(path) and not os.path.exists(keep):
+            # a store from before this alignment is kept exactly as it was, once
+            old = sqlite3.connect(path)
+            try:
+                cols = {r[1] for r in old.execute("PRAGMA table_info(datasets)")}
+                if "align" not in cols or old.execute("SELECT 1 FROM datasets WHERE align IS NULL OR align<?",
+                                                      (ci_align.ALIGN_V,)).fetchone():
+                    old.execute("VACUUM INTO ?", (keep,))
+            finally:
+                old.close()
+        con = sqlite3.connect(path)
         con.row_factory = sqlite3.Row
         con.executescript(SCHEMA)
         cols = {r[1] for r in con.execute("PRAGMA table_info(datasets)")}
         for c in ("content_sig", "notes"):
             if c not in cols:
                 con.execute(f"ALTER TABLE datasets ADD COLUMN {c} TEXT")
+        if "align" not in cols:
+            con.execute("ALTER TABLE datasets ADD COLUMN align INTEGER")
+        for tbl, add in (("events", ("bpos", "spur_d", "spur_len")), ("locations", ("spur_d", "spur_len"))):
+            have = {r[1] for r in con.execute(f"PRAGMA table_info({tbl})")}
+            for c in add:
+                if c not in have:
+                    con.execute(f"ALTER TABLE {tbl} ADD COLUMN {c} REAL")
         # upgrade pulls stored by v0.1: fingerprint them and give them the new names
         for d in con.execute("SELECT id, label, t_from, t_to FROM datasets WHERE content_sig IS NULL").fetchall():
             rows = con.execute("SELECT fno, date_a, date_b FROM fibres WHERE ds=?", (d["id"],)).fetchall()
@@ -326,7 +387,35 @@ class Store:
             con.execute("UPDATE datasets SET content_sig=?, label=?, notes=COALESCE(notes,'{}') WHERE id=?",
                         (sig, label, d["id"]))
         con.commit()
+        todo = con.execute("SELECT id FROM datasets WHERE align IS NULL OR align<?", (ci_align.ALIGN_V,)).fetchall()
+        if todo:
+            for d in todo:
+                self._realign(con, d["id"])
         return con
+
+    def _realign(self, con, ds):
+        """Put a stored pull on the backbone scale: pulls stored before alignment, or by an
+        older version of it. Only the derived columns change (backbone distance, spur place and
+        the unscheduled joint labels); the results themselves are never touched."""
+        lens = [r[0] for r in con.execute("SELECT len_a FROM fibres WHERE ds=? AND len_a", (ds,))]
+        cable_len = statistics.median(lens) if lens else None
+        locs = {r["loc"]: dict(r) for r in con.execute("SELECT * FROM locations WHERE ds=?", (ds,))}
+        sched = {k for k, v in locs.items() if v["scheduled"]}
+        evs = []
+        for r in con.execute("SELECT rowid, fno, pos, type, loc FROM events WHERE ds=?", (ds,)):
+            evs.append({"rowid": r["rowid"], "fno": r["fno"], "position": r["pos"], "type": r["type"],
+                        "location": r["loc"] if r["loc"] in sched else None, "loc_was": r["loc"]})
+        mid = [e for e in evs if _is_mid(e, cable_len)]
+        _align_mid(mid, sched)
+        for e in evs:
+            if "bpos" not in e:
+                e.update(bpos=e["position"], spur_d=None, spur_len=None, location=e["loc_was"])
+        con.executemany("UPDATE events SET loc=?, bpos=?, spur_d=?, spur_len=? WHERE rowid=?",
+                        [(e["location"], e["bpos"], e["spur_d"], e["spur_len"], e["rowid"]) for e in evs])
+        con.execute("DELETE FROM locations WHERE ds=?", (ds,))
+        _insert_locations(con, ds, mid, {k: v["kind"] for k, v in locs.items()})
+        con.execute("UPDATE datasets SET align=? WHERE id=?", (ci_align.ALIGN_V, ds))
+        con.commit()
 
     def find_same(self, section, sig):
         if not os.path.exists(os.path.join(self.folder(section), "store.sqlite")):
@@ -362,19 +451,19 @@ class Store:
         con = self.db(section)
         lens = [v["len"] for v in data["rawA"].values() if v.get("len")]
         cable_len = statistics.median(lens) if lens else None
-        mid = [e for e in data["events"] if e["position"] is not None and e["position"] > END_MARGIN_M
-               and (cable_len is None or e["position"] < cable_len - END_MARGIN_M)
-               and e["type"] in ("Splice", "Group", "Connector", "Macrobend")]
+        mid = [e for e in data["events"] if _is_mid(e, cable_len)]
         schedule, kinds = name_locations(mid, data["cable"], data["site_a"], fms_dir, log=log)
+        res = _align_mid(mid, {e["location"] for e in mid if e.get("location") and not e.get("unscheduled")})
+        log(f"  backbone: {res['anchors']} shared joints, spur loops on {res['loops']} ribbon stretches")
         label = label or tested_label(data["t_from"], data["t_to"])
         cur = con.execute(
             "INSERT INTO datasets(label,source,sha1,imported_at,section,cable,site_a,site_b,"
-            "t_from,t_to,n_fibres,n_events,schedule,content_sig,notes) "
-            "VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
+            "t_from,t_to,n_fibres,n_events,schedule,content_sig,notes,align) "
+            "VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
             (label, source, digest, time.strftime("%Y-%m-%d %H:%M"), section,
              data["cable"], data["site_a"], data["site_b"], data["t_from"], data["t_to"],
              len(set(data["rawA"]) | set(data["rawB"])), len(data["events"]), schedule, sig,
-             json.dumps(notes or {})))
+             json.dumps(notes or {}), ci_align.ALIGN_V))
         ds = cur.lastrowid
         rows = []
         for n in sorted(set(data["rawA"]) | set(data["rawB"])):
@@ -387,21 +476,14 @@ class Store:
         con.executemany("INSERT INTO odf VALUES(?,?,?,?,?,?,?,?,?,?,?)", [
             (ds, o["fno"], ribbon_of(o["fno"]), o["end"], o.get("pos"), o.get("type"), o.get("refl"),
              o.get("w1310"), o.get("w1550"), o.get("w1625"), o.get("sw")) for o in data.get("odf") or []])
-        con.executemany("INSERT INTO events VALUES(?,?,?,?,?,?,?,?,?)", [
+        con.executemany("INSERT INTO events(ds,fno,ribbon,pos,type,ab,ba,dirs,loc,bpos,spur_d,spur_len) "
+                        "VALUES(?,?,?,?,?,?,?,?,?,?,?,?)", [
             (ds, e["fno"], ribbon_of(e["fno"]), e["position"], e["type"], e["ab"], e["ba"],
-             e["dirs"], e.get("location")) for e in data["events"]])
-        groups = {}
-        for e in mid:
-            if e.get("location"):
-                groups.setdefault(e["location"], []).append(e)
-        order = sorted(groups, key=lambda k: statistics.median(x["position"] for x in groups[k]))
-        con.executemany("INSERT INTO locations VALUES(?,?,?,?,?,?,?)", [
-            (ds, k, i, statistics.median(x["position"] for x in groups[k]),
-             kinds.get(k, ""), len({x["fno"] for x in groups[k]}),
-             0 if any(x.get("unscheduled") for x in groups[k]) else 1)
-            for i, k in enumerate(order)])
+             e["dirs"], e.get("location"), e.get("bpos", e["position"]), e.get("spur_d"), e.get("spur_len"))
+            for e in data["events"]])
+        n_locs = _insert_locations(con, ds, mid, kinds)
         con.commit()
-        log(f"  stored: {len(rows)} fibres, {len(data['events'])} events, {len(order)} locations")
+        log(f"  stored: {len(rows)} fibres, {len(data['events'])} events, {n_locs} locations")
         return ds
 
     # ---------------------------------------------------------------- analysis
@@ -414,7 +496,10 @@ class Store:
         for r in con.execute("SELECT fno, loc FROM events WHERE ds=? AND loc IS NOT NULL", (ds,)):
             loc_f.setdefault(r["loc"], set()).add(r["fno"])
         groups = refine_groups(fibre_groups(fibres, float(st.get("group_tol", 100))), loc_f)
-        spurs = detect_spurs(locs, loc_f, groups, len(fibres), float(st.get("spur_gap", 1500)))
+        for l in locs:
+            l["spur_leg"], l["spur_m"] = ci_align.spur_place(l.get("spur_d"), l.get("spur_len"))
+        spurs = aligned_spurs(locs, loc_f, groups) or \
+            detect_spurs(locs, loc_f, groups, len(fibres), float(st.get("spur_gap", 1500)))
         spur_of = {l: sp["name"] for sp in spurs for l in sp["locations"]}
         nr = parse_ribbons(st.get("nr_ribbons", ""))
         for l in locs:
@@ -901,6 +986,37 @@ def refine_groups(groups, loc_f, hi=0.8, lo=0.2, min_joints=2):
             sub["label"] = f"Group {sub['id'][1:]} · {g['km']:.1f} km · {sub['ribbons']} ({len(fn)} fibres)"
             out.append(sub)
     return out
+
+
+def aligned_spurs(locs, loc_f, groups):
+    """Spurs straight from the backbone alignment: the spur locations that leave the backbone
+    at the same junction make one spur, named after its REB or ODF."""
+    gid = {f: g["id"] for g in groups for f in g["fnos"]}
+    sp = [l for l in locs if l.get("spur_d") is not None]
+    out, cur = [], []
+    for l in sorted(sp, key=lambda x: (x["pos"], x["spur_d"])):
+        if cur and l["pos"] - cur[-1]["pos"] > 60:
+            out.append(cur); cur = []
+        cur.append(l)
+    if cur:
+        out.append(cur)
+    spurs = []
+    for run in out:
+        run.sort(key=lambda x: x["spur_d"])
+        far = max(run, key=lambda x: (ci_align._turn_name(x["loc"]) or ci_align._turn_name(x.get("kind")),
+                                      -abs(x["spur_d"] - (x["spur_len"] or 0))))
+        fn = set().union(*(loc_f.get(l["loc"], set()) for l in run))
+        cnt = {}
+        for f in fn:
+            if f in gid:
+                cnt[gid[f]] = cnt.get(gid[f], 0) + 1
+        jpos = statistics.median(l["pos"] for l in run)
+        spurs.append({"name": re.sub(r"\s+(N|S)?ODF$", "", far["loc"]) + " spur",
+                      "group": max(cnt, key=cnt.get) if cnt else None,
+                      "locations": [l["loc"] for l in run], "start": jpos, "end": jpos, "junction": jpos,
+                      "length": round(max(l["spur_len"] or 0 for l in run)),
+                      "ribbons": ribbon_span({ribbon_of(f) for f in fn})})
+    return spurs
 
 
 def detect_spurs(locs, loc_f, groups, total, gap=1500.0):
