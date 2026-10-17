@@ -1,5 +1,6 @@
 """Cable Insight: Excel exports of one pull or of a comparison between two pulls."""
 import io
+from ci_store import tested_span
 
 def _spur(l):
     l = l or {}
@@ -102,7 +103,7 @@ def dataset_book(store, section, ds, st, cable_name):
     wb = _book()
     fails = [r for r in rows.values() if r["fail"]]
     summary = [["Cable", cable_name], ["Section", section], ["Pull", info["label"]],
-               ["Tested", f"{info['t_from']} to {info['t_to']} UTC"], ["Fibres", info["n_fibres"]],
+               ["Tested", tested_span(info['t_from'], info['t_to'])], ["Fibres", info["n_fibres"]],
                ["Splices judged", len(rows)], ["Fail", len(fails)], ["Pass", len(rows) - len(fails)], []] \
         + [[g["label"], g.get("route", "")] for g in an["groups"]] + [[]] + [[sp["name"] + (f" (leaves at {sp['start'] / 1000:.3f} km, {sp['length']} m long)" if sp.get("length") is not None else ""),
                 " · ".join(sp["locations"])] for sp in an["spurs"]] \
@@ -131,7 +132,8 @@ def track_book(t, cable_name):
     heads = [f"{p['label']}" for p in pulls]
     summary = [["Cable", cable_name], ["Tests", len(pulls)]] + [[p["label"], f"{p['fails']} fails of {p['judged']} splices"]
                                                                   for p in pulls] + [[]] + \
-        [[TRACK[k], v] for k, v in t["counts"].items()] + [[]] + _settings_rows(t["settings"])
+        [[TRACK[k], v] for k, v in t["counts"].items()] + [[]] + \
+        [["ODF remedials: " + TRACK[k], v] for k, v in (t.get("odf_counts") or {}).items()] + [[]] + _settings_rows(t["settings"])
     _sheet(wb, "Summary", ["Item", "Value"], summary, [40, 50], first=True)
     rows = []
     for r in t["rows"]:
@@ -149,7 +151,88 @@ def track_book(t, cable_name):
             f = r["fail"].get(str(p["id"]))
             if f is not None:
                 ws.cell(i, 8 + k).fill = red if f else green
+    orows = [[TRACK[r["status"]], r.get("since_label") or "", f"F{r['fno']:03d}", r["ribbon"], r["end"], r["site"], r["pos"]]
+             + [r["values"].get(str(p["id"])) for p in pulls] + [r["change"], f"{r['fails_in']} of {len(pulls)}"]
+             for r in t.get("odf_rows") or []]
+    ws2 = _sheet(wb, "ODF remedials over time", ["What happened", "Since", "Fibre", "Ribbon", "End", "ODF at", "Position (m)"]
+                 + heads + ["Change first to last (dB)", "Failed in"], orows, [20, 26, 8, 8, 6, 12, 12] + [14] * len(pulls) + [12, 10])
+    for i, r in enumerate(t.get("odf_rows") or [], start=2):
+        for k, p in enumerate(pulls):
+            f = r["fail"].get(str(p["id"]))
+            if f is not None:
+                ws2.cell(i, 8 + k).fill = red if f else green
     jr = [[j["loc"], round(j["pos"] / 1000, 3), j.get("spur") or ""] + [j["fails"].get(p["id"]) for p in pulls]
           for j in t["joints"]]
     _sheet(wb, "Fails by joint", ["Joint", "Backbone km", "Spur"] + heads, jr, [34, 12, 26] + [14] * len(pulls))
+    return _save(wb)
+
+
+def remedial_book(rm, cable_name, sm=None):
+    """The remedial list of one test: splice remedials and, on their own sheet, ODF remedials."""
+    st = rm["settings"]
+    wb = _book()
+    c = rm["counts"]
+    d = rm["dataset"]
+    summary = [["Cable", cable_name], ["Test", d["label"]], ["Tested", tested_span(d['t_from'], d['t_to'])], [],
+               ["Splice remedials", f"{c['splice']} splices at {c['joints']} joints"],
+               ["ODF remedials", f"{c['odf']} ({c['odf_A']} at {d.get('site_a') or 'End A'}, {c['odf_B']} at {d.get('site_b') or 'End B'})"],
+               ["Fibres with a remedial", c["fibres"]], []] + _settings_rows(st) + [["ODF limit (dB)", f"over {st.get('odf_limit', 0.5)} fails"]]
+    if sm:
+        p_, b_ = sm.get("pct") or {}, sm.get("bands") or []
+        oc = rm["counts"]
+        summary += [[], ["Splices judged", p_.get("judged")], ["Pass", f"{sm['counts']['pass']} ({p_.get('pass')}%)"],
+                    ["Fail", f"{sm['counts']['fail']} ({p_.get('fail')}%)"], ["From both ends", f"{sm['counts']['both']} ({p_.get('both')}%)"],
+                    ["One end filled", f"{sm['counts']['filled']} ({p_.get('filled')}%)"], []] + \
+                   [[("Gainer, loss under 0 dB" if b["hi"] == 0 else "Loss " + b["label"] + " dB"), f"{b['n']} ({b['pct']}%)"] for b in b_]
+    _sheet(wb, "Summary", ["Item", "Value"], summary, [26, 70], first=True)
+    _sheet(wb, "Splice remedials", ["Fibre", "Ribbon", "Joint", "Type", "Backbone km", "Spur", "S-ODF", "A-B @1550", "B-A @1550",
+                                    "Loss (dB)", "From", "Limit (dB)", "On its trace (m)"],
+           [[f"F{r['fno']:03d}", r["ribbon"], r["loc"], r["kind"], round(r["pos"] / 1000, 3) if r["pos"] is not None else None,
+             (f"{r['spur']}, {r['spur_leg']} {r['spur_m']} m" if r.get("spur_leg") else (r.get("spur") or "")),
+             "yes" if r["sodf"] else "", r["ab"], r["ba"], r["value"], HOW.get(r["how"], ""), r["limit"], r["trace_pos"]]
+            for r in rm["splices"]], [8, 8, 34, 12, 12, 30, 7, 11, 11, 10, 22, 10, 14])
+    _sheet(wb, "ODF remedials", ["Fibre", "Ribbon", "End", "ODF at", "Position on its own trace (m)", "Event", "Reflectance (dB)",
+                                 "Loss @1310", "Loss @1550", "Loss @1625", "Limit (dB)"],
+           [[f"F{r['fno']:03d}", r["ribbon"], r["end"], r["site"], r["pos"], r["type"], r["refl"], r["w1310"], r["w1550"],
+             r["w1625"], r["limit"]] for r in rm["odfs"]], [8, 8, 6, 14, 16, 12, 12, 11, 11, 11, 10])
+    return _save(wb)
+
+
+def jointer_book(t, cable_name):
+    """Cable Insight v0.12: out of spec ribbons per joint, tallied against each jointer."""
+    wb = _book()
+    d, st, T = t["dataset"], t["settings"], t["totals"]
+    summary = [["Cable", cable_name], ["Test", d.get("label")], ["Tested", tested_span(d.get('t_from'), d.get('t_to'))],
+               ["Jointers from", t.get("source", "")], [],
+               ["Out of spec ribbon", f"any fibre in the ribbon fails at that joint (pass under {st['threshold']} dB, S-ODF {st.get('sodf_limit')} dB for R{st.get('nr_ribbons')}); the whole ribbon is re-spliced"],
+               ["Joints", T["joints"]], ["Ribbons spliced", T["ribbons_spliced"]], ["Out of spec ribbons", T["ribbons_out"]],
+               ["Failing fibres", T["fibres_fail"]],
+               ["No jointer recorded", f"{t['not_recorded']['joints']} joints, {t['not_recorded']['ribbons_out']} out of spec ribbons"]]
+    _sheet(wb, "Summary", ["Item", "Value"], summary, [24, 110], first=True)
+    P = t.get("people") or {}
+    who = lambda k: " / ".join(dict.fromkeys(P.get(x.strip(), x.strip()) for x in str(k).split("/")))   # noqa: E731
+    head = ["Jointer", "Name", "Joints", "Ribbons spliced", "Out of spec ribbons", "Per joint", "% of ribbons", "Joints with any",
+            "Failing fibres", "Re-spliced ribbons (tracker)", "Exceptions (tracker)", "Tally by joint"]
+    rows = lambda xs: [[x["jointer"], who(x["jointer"]), x["joints"], x["ribbons_spliced"], x["ribbons_out"], x["per_joint"], x["pct"],   # noqa: E731
+                        x["joints_with_out"], x["fibres_fail"], x.get("ribbons_remediated"), x.get("exceptions"), ", ".join(x["joint_list"])] for x in xs]
+    W = [12, 30, 8, 10, 12, 9, 10, 10, 10, 12, 12, 90]
+    _sheet(wb, "Tally by jointer", head, rows(t["by_jointer"]), W)
+    _sheet(wb, "Tally by person", head, rows(t["by_person"]), W)
+    if t.get("technicians"):
+        _sheet(wb, "Remediation by technician", ["Technician", "Name", "Attempts", "Ribbons worked", "First attempts", "First attempt passes",
+                                                 "First attempt pass %", "All attempts pass %", "Exceptions left", "ODF attempts"],
+               [[x["tech"], P.get(x["tech"], ""), x["attempts"], x["ribbons"], x["first"], x["first_pass"], x["first_pct"], x["pass_pct"],
+                 x["exceptions"], x["odf"]] for x in t["technicians"]], [12, 26, 9, 10, 10, 10, 10, 10, 10, 10])
+    if t.get("odf_ends"):
+        _sheet(wb, "ODF ends", ["ODF", "Terminated by", "Completed", "Ribbons re-done (tracker)", "Fibres", "Exceptions"],
+               [[o["name"], o["jointers"], o["completed"], o.get("ribbons_remediated", 0), o.get("fibres_remediated", 0), o.get("exceptions", 0)]
+                for o in t["odf_ends"]], [40, 14, 12, 12, 10, 10])
+    _sheet(wb, "By joint", ["Joint", "Name", "Type", "Mileage", "Jointer", "Completed", "Ribbons spliced", "Out of spec ribbons",
+                            "Which ribbons", "Failing fibres", "Worst dB", "Re-spliced ribbons (tracker)", "Which ribbons (tracker)", "Exceptions"],
+           [[j["key"], j["name"], j["type"], j["mileage"], j["jointers"], j["completed"], j["ribbons_spliced"], j["ribbons_out"],
+             j["out_list"], j["fibres_fail"], j["worst"], j.get("ribbons_remediated"), j.get("remediated_list"), j.get("exceptions")]
+            for j in t["joints"]], [14, 40, 30, 15, 10, 12, 10, 12, 30, 10, 9, 12, 30, 10])
+    _sheet(wb, "Ribbons out of spec", ["Joint", "Jointer", "Ribbon", "Failing fibres", "Worst dB", "Fibres"],
+           [[j["key"], j["jointers"], f"R{o['ribbon']}", o["fibres"], o["worst"], ", ".join(o["fails"])] for j in t["joints"] for o in j["out"]],
+           [14, 10, 8, 10, 9, 90])
     return _save(wb)

@@ -700,6 +700,35 @@ def make_router(valid_token, check_key, sessions: dict) -> APIRouter:
         except KeyError:
             raise HTTPException(404, "One of those tests is not on the relay any more")
 
+    @router.post("/api/splice/remedials")
+    async def remedials(body: ViewIn, x_app_key: str | None = Header(default=None), x_session: str | None = Header(default=None)):
+        """Brunel 1.1.4: the remedial lists for one test, splice remedials and ODF remedials kept apart."""
+        await guard(x_app_key, x_session)
+        section = section_of(body.stem)
+        st = await asyncio.to_thread(settings_for, section, body.view)
+        try:
+            return await asyncio.to_thread(STORE.remedials, section, _ds(section, body.ds), st, getattr(body, "group", None) or None)
+        except KeyError:
+            raise HTTPException(404, "That test is not on the relay any more")
+
+    @router.post("/api/splice/remedials.xlsx")
+    async def remedials_xlsx(body: ViewIn, x_app_key: str | None = Header(default=None), x_session: str | None = Header(default=None)):
+        await guard(x_app_key, x_session)
+        section = section_of(body.stem)
+        st = await asyncio.to_thread(settings_for, section, body.view)
+        ds = _ds(section, body.ds)
+        g = getattr(body, "group", None) or None
+        try:
+            rm = await asyncio.to_thread(STORE.remedials, section, ds, st, g)
+            sm = await asyncio.to_thread(STORE.summary, section, ds, st, g)
+        except KeyError:
+            raise HTTPException(404, "That test is not on the relay any more")
+        import ci_export
+        data = await asyncio.to_thread(ci_export.remedial_book, rm, body.stem.upper(), sm)
+        fn = f"{body.stem.upper()} remedials {rm['dataset'].get('label') or ds}.xlsx".replace("/", "-")
+        return Response(data, media_type="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+                        headers={"Content-Disposition": f"attachment; filename*=UTF-8''{quote(fn)}"})
+
     @router.post("/api/splice/compare.xlsx")
     async def compare_xlsx(body: CompareIn, x_app_key: str | None = Header(default=None), x_session: str | None = Header(default=None)):
         await guard(x_app_key, x_session)

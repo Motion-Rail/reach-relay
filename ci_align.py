@@ -15,7 +15,7 @@ the spur (out and back), so it shows only on the fibres that go through that spu
 import bisect
 import statistics
 
-ALIGN_V = 2
+ALIGN_V = 3
 STEP_M = 40.0          # an offset change bigger than this between two anchors is a spur loop
 SAME_M = 30.0          # a fibre's own reading within this of its ribbon's is trusted
 EDGE_M = 15.0          # slack at both ends of a loop

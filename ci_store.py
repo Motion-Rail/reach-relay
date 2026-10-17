@@ -18,6 +18,7 @@ Filled values are always marked.
 """
 import gzip
 import hashlib
+import collections
 import json
 import os
 import re
@@ -123,6 +124,27 @@ def is_pull_workbook(path):
         return ok
     except Exception:
         return False
+
+
+def uk_time(iso):
+    """FMS times are UTC; show them as UK clock time (BST from the last Sunday of March to the last Sunday
+    of October, 01:00 UTC), e.g. 14 Oct 2026 15:39. No time zone database needed (Windows has none)."""
+    import datetime as _dt
+    try:
+        t = _dt.datetime.fromisoformat(str(iso)[:19])
+    except ValueError:
+        return str(iso or "")
+    def last_sun(y, m):
+        d = _dt.datetime(y, m, 31 if m in (3, 10) else 30, 1)
+        return d - _dt.timedelta(days=(d.weekday() + 1) % 7)
+    if last_sun(t.year, 3) <= t < last_sun(t.year, 10):
+        t += _dt.timedelta(hours=1)
+    return t.strftime("%d %b %Y %H:%M").lstrip("0")
+
+
+def tested_span(t_from, t_to):
+    """Start = first trace used, end = last trace used, both in UK time."""
+    return f"start {uk_time(t_from)} (first trace), end {uk_time(t_to)} (last trace), UK time"
 
 
 def tested_label(t_from, t_to):
@@ -302,9 +324,14 @@ def found_locations(events, cable, lengths):
 
 
 # --------------------------------------------------------------------------- backbone
-def _is_mid(e, cable_len):
+def _is_mid(e, cable_len, lens=None):
+    """A field event: past the launch and the ODF at End A, and short of the far end of its own fibre
+    (the ODF at End B, which the ODF view judges at its own limit on End B's trace). The far end is
+    each fibre's own length, so fibres shorter than most (another route) do not have their far end
+    ODF judged as a splice."""
     p = e.get("position")
-    return (p is not None and p > END_MARGIN_M and (cable_len is None or p < cable_len - END_MARGIN_M)
+    end = (lens or {}).get(e.get("fno")) or cable_len
+    return (p is not None and p > END_MARGIN_M and (end is None or p < end - END_MARGIN_M)
             and e.get("type") in ("Splice", "Group", "Connector", "Macrobend"))
 
 
@@ -539,7 +566,8 @@ class Store:
         for r in con.execute("SELECT rowid, fno, pos, type, loc FROM events WHERE ds=? ORDER BY rowid", (ds,)):
             evs.append({"rowid": r["rowid"], "fno": r["fno"], "position": r["pos"], "type": r["type"],
                         "location": r["loc"] if r["loc"] in sched else None, "loc_was": r["loc"]})
-        mid = [e for e in evs if _is_mid(e, cable_len)]
+        flen = {r[0]: r[1] or r[2] for r in con.execute("SELECT fno, len_a, len_b FROM fibres WHERE ds=?", (ds,))}
+        mid = [e for e in evs if _is_mid(e, cable_len, flen)]
         kinds = {k: v["kind"] for k, v in locs.items()}
         if not own:
             # no Distances schedule: the shared joints are found (and named from learned locations)
@@ -549,8 +577,8 @@ class Store:
             con.execute("UPDATE datasets SET schedule=? WHERE id=?", (label, ds))
         _align_mid(mid, sched, found=not own)
         for e in evs:
-            if "bpos" not in e:
-                e.update(bpos=e["position"], spur_d=None, spur_len=None, location=e["loc_was"])
+            if "bpos" not in e:             # launch, ODFs and fibre ends: never a joint
+                e.update(bpos=e["position"], spur_d=None, spur_len=None, location=None)
         con.executemany("UPDATE events SET loc=?, bpos=?, spur_d=?, spur_len=? WHERE rowid=?",
                         [(e["location"], e["bpos"], e["spur_d"], e["spur_len"], e["rowid"]) for e in evs])
         con.execute("DELETE FROM locations WHERE ds=?", (ds,))
@@ -558,6 +586,187 @@ class Store:
         apply_names(con, ds, self.names(info["section"]))
         con.execute("UPDATE datasets SET align=? WHERE id=?", (ci_align.ALIGN_V, ds))
         con.commit()
+
+    # ---------------------------------------------------------------- assets and their jointers (v0.12)
+    def assets(self, section):
+        """Joints and ODFs as assets with who made them, from the installation tracker:
+        assets.json {"source", "assets": [{key, name, asset, type, mileage, jointers, completed, qcs,
+        match: [joint names], bpos: [joint places], at: [{ribbons, pos, role}], ribbons, sodf}]}.
+        An asset is found by its joint name in the schedule (match), by the place of a joint found from
+        the results (bpos, 30 m), or where each ribbon group reads it on its own trace (at, raw distance)."""
+        try:
+            with open(os.path.join(self.folder(section), "assets.json"), encoding="utf-8") as fh:
+                return json.load(fh)
+        except (OSError, ValueError):
+            return {"assets": []}
+
+    def save_assets(self, section, data):
+        os.makedirs(self.folder(section), exist_ok=True)
+        path = os.path.join(self.folder(section), "assets.json")
+        with open(path + ".tmp", "w", encoding="utf-8") as fh:
+            json.dump(data, fh, indent=1)
+        os.replace(path + ".tmp", path)
+
+    def remediations(self, section):
+        """Remediation tracker rows for this cable (remediations.json, from the cable's Remediation Tracker):
+        {"source", "rows": [{joint, part, loc, kind (splice|odf), ribbon, fno, status, final, exc,
+        attempts: [{date, tech, result, pre, post, notes}]}]}. joint is the asset key in assets.json."""
+        try:
+            with open(os.path.join(self.folder(section), "remediations.json"), encoding="utf-8") as fh:
+                return json.load(fh)
+        except (OSError, ValueError):
+            return {"rows": []}
+
+    @staticmethod
+    def _rem_tally(R, assets, same):
+        """Remediations against the original jointer (ribbons re-spliced at their joints) and against the
+        technician who did each attempt (first attempt pass rate, exceptions left)."""
+        jt = {a["key"]: (a.get("jointers") or "") for a in assets}
+        rows = [r for r in R.get("rows", []) if str(r.get("status") or "").upper() != "SUPERSEDED"]
+        per_joint = {}
+        for r in rows:
+            j = per_joint.setdefault(r["joint"], {"ribbons": set(), "fibres": set(), "exceptions": 0, "open": 0})
+            j["ribbons"].add(r["ribbon"])
+            j["fibres"].add(r["fno"])
+            st_ = str(r.get("status") or "").upper()
+            j["exceptions"] += st_.startswith("EXCEPTION")
+            j["open"] += st_ in ("IN PROGRESS", "NOT STARTED", "")
+        tech = {}
+        for r in rows:
+            done = [a for a in r.get("attempts", []) if str(a.get("result") or "").lower() in ("pass", "fail")]
+            for i, a in enumerate(done):
+                who = re.split(r"[\s/,-]+", (a.get("tech") or "").strip().upper())[0] or "none"
+                who = same.get(who, who)
+                t = tech.setdefault(who, {"tech": who, "attempts": 0, "passed": 0, "first": 0, "first_pass": 0,
+                                          "ribbons": set(), "exceptions": 0, "odf": 0})
+                ok = str(a["result"]).lower() == "pass"
+                t["attempts"] += 1
+                t["passed"] += ok
+                t["ribbons"].add((r["joint"], r["ribbon"]))
+                t["odf"] += r.get("kind") == "odf"
+                if i == 0:
+                    t["first"] += 1
+                    t["first_pass"] += ok
+                if i == len(done) - 1 and str(r.get("status") or "").upper().startswith("EXCEPTION"):
+                    t["exceptions"] += 1
+        techs = []
+        for t in tech.values():
+            t["ribbons"] = len(t["ribbons"])
+            t["first_pct"] = round(100.0 * t["first_pass"] / t["first"], 1) if t["first"] else None
+            t["pass_pct"] = round(100.0 * t["passed"] / t["attempts"], 1) if t["attempts"] else None
+            techs.append(t)
+        techs.sort(key=lambda t: -t["attempts"])
+        joints = {k: {"ribbons_remediated": len(v["ribbons"]), "fibres_remediated": len(v["fibres"]),
+                      "exceptions": v["exceptions"], "open": v["open"],
+                      "remediated_list": ", ".join(f"R{x}" for x in sorted(v["ribbons"])), "jointers": jt.get(k, "not in assets")}
+                  for k, v in per_joint.items()}
+        return joints, techs
+
+    def jointer_tally(self, section, ds, st):
+        """Out of spec ribbons at every joint, tallied against the jointer who made it. A ribbon is out of
+        spec at a joint when any of its fibres fails there (its worst splice, judged as in the cable view;
+        one end only readings left out when the settings leave them out). The whole ribbon is re-spliced."""
+        con = self.db(section)
+        A = self.assets(section)
+        an = self.analysis(section, ds, st)
+        nr = an["nr"]
+        tested = {r["fno"]: r["ribbon"] for r in con.execute("SELECT fno, ribbon FROM fibres WHERE ds=?", (ds,))}
+        sizes = collections.Counter(tested.values())
+        locpos = {r["loc"]: r["pos"] for r in con.execute("SELECT loc, pos FROM locations WHERE ds=?", (ds,))}
+        evs = [dict(r) for r in con.execute(
+            "SELECT fno, ribbon, loc, ab, ba, pos FROM events WHERE ds=? AND type IN ('Splice','Group')", (ds,))]
+        thr = float(st["threshold"])
+        joints, used = [], set()
+        same = {k.upper(): v.upper() for k, v in (A.get("same") or {}).items()}
+        rem_j, techs = self._rem_tally(self.remediations(section), A.get("assets", []), same)
+        for a in A.get("assets", []):
+            if a.get("odf_end"):
+                continue
+            mine = []
+            for i, e in enumerate(evs):
+                loc = e["loc"] or ""
+                hit = any(loc == m or loc.startswith(m + " ") for m in a.get("match") or [])
+                if not hit and e["loc"] and a.get("bpos"):
+                    lp = locpos.get(e["loc"])
+                    hit = lp is not None and any(abs(lp - b) <= 30 for b in a["bpos"])
+                if not hit:
+                    for w in a.get("at") or []:
+                        if e["ribbon"] in parse_ribbons(w["ribbons"]) and abs(e["pos"] - w["pos"]) <= w.get("tol", 30):
+                            hit = True
+                            break
+                if hit:
+                    mine.append(e)
+                    used.add(i)
+            per = collections.defaultdict(list)
+            for e in mine:
+                per[e["ribbon"]].append(e)
+            spliced = parse_ribbons(a["ribbons"]) if a.get("ribbons") else {r for r, g in per.items() if len(g) >= 3}
+            spliced &= set(sizes)
+            out, fibres_fail, worst, n_spl = [], 0, None, 0
+            for rb in sorted(spliced):
+                g = per.get(rb, [])
+                rav = ribbon_averages(g, sizes.get(rb, FIBRES_PER_RIBBON))
+                lim = float(st.get("sodf_limit", 0.30)) if a.get("sodf") and (not nr or rb in nr) else thr
+                byf = collections.defaultdict(list)
+                for e in g:
+                    byf[e["fno"]].append(e)
+                bad = []
+                for f, es in byf.items():
+                    vals = [splice_value(e["ab"], e["ba"], st, *rav) for e in es]
+                    vals = [(v, h) for v, h, _ in vals if v is not None and h != "one_way"]
+                    n_spl += len(vals)
+                    if not vals:
+                        continue
+                    v = max(x[0] for x in vals)
+                    worst = v if worst is None or v > worst else worst
+                    if v >= lim:
+                        bad.append((f, round(v, 3)))
+                if bad:
+                    out.append({"ribbon": rb, "fibres": len(bad), "worst": max(b[1] for b in bad),
+                                "fails": [f"F{f:03d} {v:.2f}" for f, v in sorted(bad)]})
+                    fibres_fail += len(bad)
+            joints.append({k: a.get(k, "") for k in ("key", "name", "asset", "type", "mileage", "jointers", "completed", "qcs")}
+                          | {k: v for k, v in rem_j.get(a.get("key"), {}).items() if k != "jointers"}
+                          | {"ribbons_spliced": len(spliced), "ribbons_out": len(out), "fibres_fail": fibres_fail,
+                             "worst": round(worst, 3) if worst is not None else None, "readings": n_spl,
+                             "out": out, "out_list": ", ".join(f"R{o['ribbon']}" for o in out)})
+
+        def tally(key_of):
+            t = {}
+            for j in joints:
+                for who in key_of(j):
+                    x = t.setdefault(who, {"jointer": who, "joints": 0, "ribbons_spliced": 0, "ribbons_out": 0,
+                                           "fibres_fail": 0, "joints_with_out": 0, "joint_list": []})
+                    x["joints"] += 1
+                    x["ribbons_spliced"] += j["ribbons_spliced"]
+                    x["ribbons_out"] += j["ribbons_out"]
+                    x["fibres_fail"] += j["fibres_fail"]
+                    x["joints_with_out"] += bool(j["ribbons_out"])
+                    x["joint_list"].append(f"{j['key']} {j['ribbons_out']}")
+                    x["ribbons_remediated"] = x.get("ribbons_remediated", 0) + j.get("ribbons_remediated", 0)
+                    x["exceptions"] = x.get("exceptions", 0) + j.get("exceptions", 0)
+            for x in t.values():
+                x["per_joint"] = round(x["ribbons_out"] / x["joints"], 2) if x["joints"] else None
+                x["pct"] = round(100.0 * x["ribbons_out"] / x["ribbons_spliced"], 1) if x["ribbons_spliced"] else None
+            return sorted(t.values(), key=lambda x: (-x["ribbons_out"], x["jointer"]))
+        recorded = lambda j: [] if not j["jointers"] or j["jointers"].startswith("not") else [j["jointers"].replace(" ", "")]   # noqa: E731
+        people = lambda j: list(dict.fromkeys(same.get(p.strip().upper(), p.strip().upper()) for p in recorded(j)[0].split("/"))) if recorded(j) else []   # noqa: E731
+        nobody = [j for j in joints if not recorded(j)]
+        info = dict(con.execute("SELECT id, label, t_from, t_to FROM datasets WHERE id=?", (ds,)).fetchone())
+        # ODF ends (no splice tally): remediations only
+        odfs = []
+        for a in A.get("assets", []):
+            if a.get("odf_end"):
+                odfs.append({k: a.get(k, "") for k in ("key", "name", "type", "jointers", "completed")} | rem_j.get(a["key"], {}))
+        R = self.remediations(section)
+        return {"dataset": info, "settings": st, "source": A.get("source", ""), "joints": joints,
+                "people": A.get("people", {}), "technicians": techs, "odf_ends": odfs, "rem_source": R.get("source", ""),
+                "rem_unmatched": sorted({r["loc"] for r in R.get("rows", []) if r["joint"] not in {a["key"] for a in A.get("assets", [])}}),
+                "by_jointer": tally(lambda j: recorded(j)), "by_person": tally(people),
+                "not_recorded": {"joints": len(nobody), "ribbons_out": sum(j["ribbons_out"] for j in nobody)},
+                "totals": {"joints": len(joints), "ribbons_spliced": sum(j["ribbons_spliced"] for j in joints),
+                           "ribbons_out": sum(j["ribbons_out"] for j in joints),
+                           "fibres_fail": sum(j["fibres_fail"] for j in joints)}}
 
     # ---------------------------------------------------------------- names given in the app
     def names(self, section):
@@ -658,7 +867,9 @@ class Store:
         con = self.db(section)
         lens = [v["len"] for v in data["rawA"].values() if v.get("len")]
         cable_len = statistics.median(lens) if lens else None
-        mid = [e for e in data["events"] if _is_mid(e, cable_len)]
+        flen = {n: (data["rawA"].get(n) or {}).get("len") or (data["rawB"].get(n) or {}).get("len")
+                for n in set(data["rawA"]) | set(data["rawB"])}
+        mid = [e for e in data["events"] if _is_mid(e, cable_len, flen)]
         lens_by = {n: (data["rawA"].get(n) or {}).get("len") or (data["rawB"].get(n) or {}).get("len")
                    for n in set(data["rawA"]) | set(data["rawB"])}
         schedule, kinds = name_locations(mid, data["cable"], data["site_a"], fms_dir, log=log, lengths=lens_by)
@@ -764,7 +975,7 @@ class Store:
         fibres = [f for f in an["fibres"] if keep is None or f["fno"] in keep]
         meta = {l["loc"]: l for l in an["locs"]}
         groups, ravg = self._groups(con, ds)
-        cells = {}
+        cells, vals = {}, []
         counts = {"splices": 0, "both": 0, "filled": 0, "filled_ribbon": 0, "fail": 0,
                   "fail_both": 0, "fail_filled": 0, "fail_sodf": 0, "pass": 0, "pass_low": 0,
                   "gainers": 0, "one_way_left_out": 0, "one_way_high": 0, "spur_fail": 0}
@@ -808,9 +1019,26 @@ class Store:
                     counts["pass_low"] += v < 0.10
                     if m and m.get("sodf") and lim > float(st["threshold"]) and v >= float(st["threshold"]):
                         counts["fail_sodf"] += 1      # would fail at the single splice limit
+                vals.append((v, v >= lim))
                 if c["worst"] is None or v > c["worst"]:
                     c["worst"], c["worst_how"] = round(v, 3), how
         nr_suggest = suggest_nr(groups, meta)
+        thr = float(st["threshold"])
+        edges = [("Gainer (under 0)", None, 0.0), ("0 to 0.05", 0.0, 0.05), ("0.05 to 0.10", 0.05, 0.10)]
+        if thr > 0.10:
+            edges.append((f"0.10 to {thr:g}", 0.10, thr))
+        edges += [(f"{thr:g} to 0.30", thr, 0.30), ("0.30 to 0.50", 0.30, 0.50), ("0.50 and over", 0.50, None)]
+        judged = len(vals)
+        bands = []
+        for lbl, lo, hi in edges:
+            xs = [f for v, f in vals if (lo is None or v >= lo) and (hi is None or v < hi)]
+            bands.append({"label": lbl, "lo": lo, "hi": hi, "n": len(xs), "fail": sum(xs),
+                          "pct": round(100.0 * len(xs) / judged, 1) if judged else 0.0})
+        pc = lambda n: round(100.0 * n / judged, 1) if judged else 0.0          # noqa: E731
+        pct = {"pass": pc(counts["pass"]), "fail": pc(counts["fail"]), "pass_low": pc(counts["pass_low"]),
+               "both": pc(counts["both"]), "filled": pc(counts["filled"]), "fail_sodf": pc(counts["fail_sodf"]),
+               "spur_fail": pc(counts["spur_fail"]), "gainers": round(100.0 * counts["gainers"] / counts["both"], 1) if counts["both"] else 0.0,   # of the both end splices
+               "judged": judged}
         e2e = [((f["a1550"] or 0) + (f["b1550"] or 0)) / 2 for f in fibres
                if f["a1550"] is not None and f["b1550"] is not None]
         nmin = max(3, round(len(fibres) * 0.05))
@@ -823,7 +1051,7 @@ class Store:
         return {"dataset": info, "locations": locs,
                 "ribbons": sorted({f["ribbon"] for f in fibres}),
                 "fibres_tested": len(fibres), "both_ends": sum(1 for f in fibres if f["date_a"] and f["date_b"]),
-                "counts": counts, "settings": st,
+                "counts": counts, "settings": st, "bands": bands, "pct": pct,
                 "e2e_avg": round(sum(e2e) / len(e2e), 3) if e2e else None,
                 "cells": list(cells.values()),
                 "groups": [{k: v for k, v in g.items() if k != "fnos"} for g in an["groups"]],
@@ -931,6 +1159,27 @@ class Store:
                 "counts": counts, "fibres": out, "settings": st}
 
     # ---------------------------------------------------------------- snapshots and compare
+    def delete_dataset(self, section, ds):
+        """Take one pull off this cable. The store is copied first (store.before-remove-<id>-<time>.sqlite);
+        the raw results stay, so the same tests can be built again by a pull. Names, snapshots, assets and
+        remediations are kept."""
+        con = self.db(section)
+        row = con.execute("SELECT id, label FROM datasets WHERE id=?", (ds,)).fetchone()
+        if not row:
+            raise KeyError("dataset")
+        path = os.path.join(self.folder(section), "store.sqlite")
+        con.commit()
+        bak = os.path.join(self.folder(section), f"store.before-remove-{ds}-{time.strftime('%Y%m%d-%H%M%S')}.sqlite")
+        dst = sqlite3.connect(bak)
+        con.backup(dst)
+        dst.close()
+        for t in ("events", "fibres", "locations", "odf"):
+            con.execute(f"DELETE FROM {t} WHERE ds=?", (ds,))
+        con.execute("DELETE FROM datasets WHERE id=?", (ds,))
+        con.commit()
+        return {"removed": {"id": row["id"], "label": row["label"]}, "backup": os.path.basename(bak),
+                "datasets": self.datasets(section)}
+
     def set_dataset(self, section, ds, label=None, baseline=None):
         """Rename a pull or mark it as the baseline. Results themselves are never changed."""
         con = self.db(section)
@@ -1213,6 +1462,46 @@ class Store:
         self.save_snapshots(section, snaps)
         return {"snapshot": entry, "snapshots": snaps}
 
+    def remedials(self, section, ds, st, group=None):
+        """The remedial list for one test: splice remedials (fails at joints, worst splice per fibre per
+        joint, with the S-ODF limit where it applies) and, kept apart, ODF remedials (the ODF at each end
+        over the ODF limit, on that end's own trace)."""
+        info = next((x for x in self.datasets(section) if x["id"] == ds), None)
+        if not info:
+            raise KeyError("dataset")
+        rows, an = self.judged(section, ds, st)
+        gsel = next((g for g in an["groups"] if g["id"] == group), None)
+        keep = gsel["fnos"] if gsel else None
+        meta = {l["loc"]: l for l in an["locs"]}
+        sp = []
+        for r in rows.values():
+            if not r["fail"] or (keep is not None and r["fno"] not in keep):
+                continue
+            m = meta.get(r["loc"]) or {}
+            sp.append({"fno": r["fno"], "ribbon": r["ribbon"], "loc": r["loc"], "pos": m.get("pos"), "kind": m.get("kind") or "",
+                       "spur": m.get("spur"), "spur_leg": m.get("spur_leg"), "spur_m": m.get("spur_m"),
+                       "sodf": bool(m.get("sodf")), "ab": r["ab"], "ba": r["ba"], "value": r["value"], "how": r["how"],
+                       "limit": r["limit"], "trace_pos": r["pos"]})
+        sp.sort(key=lambda r: (r["pos"] if r["pos"] is not None else 9e9, r["fno"]))
+        o = self.odf(section, ds, st)
+        od = []
+        for f in o["fibres"]:
+            if keep is not None and f["fno"] not in keep:
+                continue
+            for end in ("A", "B"):
+                x = f.get(end)
+                if x and x.get("fail"):
+                    od.append({"fno": f["fno"], "ribbon": f["ribbon"], "end": end,
+                               "site": o.get("site_a" if end == "A" else "site_b") or ("End " + end),
+                               "pos": x.get("pos"), "type": x.get("type"), "refl": x.get("refl"), "w1310": x.get("w1310"),
+                               "w1550": x.get("w1550"), "w1625": x.get("w1625"), "limit": o["limit"]})
+        od.sort(key=lambda r: (r["end"], r["fno"]))
+        return {"dataset": {k: info.get(k) for k in ("id", "label", "t_from", "t_to", "n_fibres", "site_a", "site_b")},
+                "settings": st, "group": group if gsel else None, "splices": sp, "odfs": od,
+                "counts": {"splice": len(sp), "odf": len(od), "odf_A": sum(1 for r in od if r["end"] == "A"),
+                           "odf_B": sum(1 for r in od if r["end"] == "B"),
+                           "joints": len({r["loc"] for r in sp}), "fibres": len({r["fno"] for r in sp} | {r["fno"] for r in od})}}
+
     def trend(self, section, st, group=None, ids=None):
         """Fails at every joint in every kept pull (or the chosen ones), oldest first."""
         t = self.track(section, ids, st, group)
@@ -1299,7 +1588,38 @@ class Store:
         joints.sort(key=lambda j: (j["pos"], -1 if j["spur_d"] is None else j["spur_d"]))
         for j in joints:
             j.pop("named", None); j.pop("key", None)
+        # ODF remedials, kept apart from splices: the ODF at each end on that end's own trace, at the ODF limit
+        od_rows, od_counts = [], {k: 0 for k in TRACK_STATUS}
+        ods, sites = {}, {}
+        for d in pulls:
+            sn = snaps.get(d.get("content_sig"))
+            dst = dict(DEFAULT_SETTINGS) | sn["settings"] if sn and sn.get("settings") else st
+            o = self.odf(section, d["id"], dst)
+            sites = {"A": o.get("site_a") or "End A", "B": o.get("site_b") or "End B"}
+            for f in o["fibres"]:
+                for end in ("A", "B"):
+                    x = f.get(end)
+                    if not x or x.get("w1550") is None:
+                        continue
+                    e = ods.setdefault((f["fno"], end), {"values": {}, "fail": {}, "pos": {}})
+                    e["values"][d["id"]], e["fail"][d["id"]], e["pos"][d["id"]] = x["w1550"], bool(x["fail"]), x.get("pos")
+        for (fno, end), e in ods.items():
+            if not any(e["fail"].values()):
+                continue
+            status, since = _track_status([e["fail"].get(i) for i in order], order)
+            od_counts[status] += 1
+            seen = [e["values"][i] for i in order if i in e["values"]]
+            od_rows.append({"fno": fno, "ribbon": ribbon_of(fno), "end": end, "site": sites.get(end),
+                            "pos": next((e["pos"][i] for i in reversed(order) if i in e["pos"]), None),
+                            "values": {str(i): e["values"].get(i) for i in order},
+                            "fail": {str(i): e["fail"].get(i) for i in order}, "status": status, "since": since,
+                            "since_label": lab.get(since), "change": round(seen[-1] - seen[0], 3) if len(seen) >= 2 else None,
+                            "fails_in": sum(1 for v in e["fail"].values() if v)})
+        od_rows.sort(key=lambda r: (TRACK_STATUS.index(r["status"]), r["end"], r["fno"]))
+        for p_, d in zip(out_pulls, pulls):
+            p_["odf_fails"] = sum(1 for e in ods.values() if e["fail"].get(d["id"]))
         return {"pulls": out_pulls, "joints": joints, "rows": rows, "counts": counts, "settings": st,
+                "odf_rows": od_rows, "odf_counts": od_counts,
                 "group": group, "all": [{"id": d["id"], "label": d["label"], "t_to": d["t_to"]} for d in allp]}
 
     @staticmethod
